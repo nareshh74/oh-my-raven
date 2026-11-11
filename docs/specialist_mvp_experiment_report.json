@@ -1,0 +1,353 @@
+{
+  "worktree": "C:\\learn\\Raven.worktrees\\specialist-mvp",
+  "python": "C:\\learn\\Raven\\.venv\\Scripts\\python.exe",
+  "experiment_1": {
+    "live_failover_result": "SECONDARY_SPECIALIST_OK",
+    "telemetry_rows": [
+      {
+        "schema_version": 1,
+        "event_id": "a86b8f61-1ade-46d8-bd88-321113f8476f",
+        "timestamp": "2026-11-11T07:52:44.881022+00:00",
+        "task_id": "exp1-live",
+        "specialist": "PrimaryCli",
+        "attempt_count": 2,
+        "chosen_backend": "SecondaryCli",
+        "model": "same-model",
+        "failover_chain": [
+          {
+            "backend": "PrimaryCli",
+            "status": "failed",
+            "error_class": "CliAgentExitError",
+            "duration_ms": 299.49
+          },
+          {
+            "backend": "SecondaryCli",
+            "status": "succeeded",
+            "error_class": null,
+            "duration_ms": 221.107
+          }
+        ],
+        "same_model_fallback": true,
+        "final_status": "succeeded",
+        "total_duration_ms": 520.888,
+            "worktree_path": "<temp>/exp1_fkmawe_s"
+      }
+    ],
+    "dirty_block": {
+      "blocked": true,
+      "attempt_receipts": [
+        {
+          "backend": "PrimaryTimeout",
+          "status": "blocked_dirty_worktree",
+          "error_class": "TimeoutError",
+          "duration_ms": 0.012,
+          "dirty_paths": [
+            "partial.txt"
+          ]
+        }
+      ]
+    },
+    "telemetry_has_failover_chain": true,
+    "telemetry_has_same_model_fallback_field": true
+  },
+  "experiment_2": {
+    "repo_root_head": "fa6799ca",
+    "repo_root_dirty_entries": 0,
+    "repo_root_is_dirty": false,
+    "repo_root_at_base": false,
+    "worktree_heads": [
+      "ccfc24abe342f7dd1422343c348cbdc8beeb0316",
+      "ccfc24abe342f7dd1422343c348cbdc8beeb0316"
+    ],
+    "heads_equal_base": true,
+    "worktrees_clean": [
+      true,
+      true
+    ],
+    "untracked_files_leaked_into_worktrees": [],
+    "receipts": [
+      {
+        "node_id": "slice_a",
+        "head_sha": "a0c610df336bb501e4873cb39a680f11a14be3d0",
+        "base_sha": "ccfc24abe342f7dd1422343c348cbdc8beeb0316",
+        "worktree_path": "<temp>/exp2_3d8hkbzl/exp-slice_a",
+        "changed_paths": [
+          "raven/agent/subagent/exp_slice_a.txt"
+        ],
+        "committed": true,
+        "tests": []
+      },
+      {
+        "node_id": "slice_b",
+        "head_sha": "f06995a75e049c50ee7d0f0397ac7704dedde3d2",
+        "base_sha": "ccfc24abe342f7dd1422343c348cbdc8beeb0316",
+        "worktree_path": "<temp>/exp2_3d8hkbzl/exp-slice_b",
+        "changed_paths": [
+          "tests/exp_slice_b.txt"
+        ],
+        "committed": true,
+        "tests": []
+      }
+    ],
+    "integrated_head": "66c888eea30da7ce744e9ad11dd491fe29ff5705",
+    "files_at_integrated_head": {
+      "raven/agent/subagent/exp_slice_a.txt": true,
+      "tests/exp_slice_b.txt": true
+    },
+    "experiment_worktrees_removed": true
+  },
+  "experiment_3": {
+    "alias_identity_rejected": {
+      "raised": "IndependentReviewError: reviewer backend must differ from every author backend"
+    },
+    "missing_ocr_rejected": {
+      "raised": "IndependentReviewError: mandatory ocr review evidence missing or failed"
+    },
+    "valid_receipt_accepted": {
+      "result": "approved"
+    },
+    "ledger": {
+      "record": {
+        "attempt_count": 1,
+        "backend": "b",
+        "failure_class": "TimeoutError",
+        "worktree_path": "",
+        "committed_sha": "",
+        "dirty_paths": [],
+        "next_action": "retry"
+      },
+      "persisted_across_instances": true
+    },
+    "cycle_tracker": {
+      "first_count": 1,
+      "second_call_on_new_instance": "not raised"
+    },
+    "charter": {
+      "matching": "[BEGIN UNTRUSTED CONTEXT CHARTER]\nRaven specialist orchestration\nRaven specialist failover notes [REDACTED]\n[END UNTRUSTED CONTEXT CHARTER]",
+      "matching_redacted": true,
+      "negative_control": "",
+      "negative_is_empty": true
+    }
+  },
+  "experiment_4": {
+    "saved_path": "~/.raven/workspace/playbooks/autonomous-feature-delivery/playbook.md",
+    "exists": true,
+    "oh_my_raven_saved_path": "~/.raven/workspace/playbooks/oh-my-raven/playbook.md",
+    "oh_my_raven_exists": true,
+    "node_ids": [
+      "cto_strategy",
+      "slice_a",
+      "slice_b",
+      "integrate",
+      "review",
+      "remediate",
+      "re_review"
+    ],
+    "validate_graph_nodes": [],
+    "validate_is_empty": true
+  },
+  "experiment_5_oh_my_raven_rtm": {
+    "feature_name": "oh-my-raven",
+    "requirement_count": 20,
+    "all_met": true,
+    "negative_checks": {
+      "deferred_rejected": "PrematureCompletionError: acceptance receipt has deferred requirements: R15",
+      "test_only_wiring_rejected": "PrematureCompletionError: requirement 'R-test' violates no_test_only_wiring: entrypoint_caller 'tests/test_specialist_orchestration_e2e.py:test_holistic_charter_and_consequence_matrix' points to test/script path",
+      "nested_test_path_rejected": "PrematureCompletionError: requirement 'R-nested' violates no_test_only_wiring: entrypoint_caller 'raven/agent/subagent/tests/test_gate.py:foo' points to test/script path",
+      "missing_expected_ids_rejected": "PrematureCompletionError: Missing required IDs from AcceptanceReceipt: ['R16', 'R17', 'R18', 'R19', 'R20']"
+    },
+    "acceptance_receipt": {
+      "feature_name": "oh-my-raven",
+      "requirements": [
+        {
+          "id": "R1",
+          "description": "Brand specialist orchestration as oh-my-raven",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/oh_my_raven.py:BRAND_NAME",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R2",
+          "description": "Backward-compatible specialist_support re-exports",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/specialist_support.py:__all__",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R3",
+          "description": "Ordered failover across route targets",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/backends/routing.py:failover_chain",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R4",
+          "description": "Failover cooldown tracking",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/backends/routing.py:_record_cooldown",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R5",
+          "description": "Dirty worktree failover block",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/backends/routing.py:_check_dirty_worktree",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R6",
+          "description": "Observational JSONL telemetry with redaction",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/backends/routing.py:TelemetryLogger",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R7",
+          "description": "Workload-learning telemetry scoring",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/backends/routing.py:_workload_score",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R8",
+          "description": "Static write file_scope overlap validation",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/dag_graph.py:_execution_scope_errors",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R9",
+          "description": "Isolated detached git worktree provisioning",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/oh_my_raven.py:provision_worktree",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R10",
+          "description": "Deterministic slice integration via cherry-pick",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/oh_my_raven.py:integrate_slices",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R11",
+          "description": "Durable recovery ledger and quarantine",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/oh_my_raven.py:DurableRecoveryLedger",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R12",
+          "description": "Independent review receipt verification",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/oh_my_raven.py:verify_review_receipt",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R13",
+          "description": "Bounded review remediation cycle tracker",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/oh_my_raven.py:ReviewCycleTracker",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R14",
+          "description": "Auto-injected untrusted context charter in DAG runner",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/dag_runner.py:inject_charter",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R15",
+          "description": "Plan node 5-dimension ConsequenceMatrix gate",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/oh_my_raven.py:ConsequenceMatrix",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R16",
+          "description": "Requirement traceability anti-premature-completion gate",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/oh_my_raven.py:RequirementTraceabilityGate",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R17",
+          "description": "Harness-free SpecialistSubagentConfig (kind='specialist', no command, no hardcoded routes)",
+          "status": "met",
+          "entrypoint_caller": "raven/config/schema.py:SpecialistSubagentConfig",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R18",
+          "description": "Dynamic Runtime Harness Pool auto-discovery in SubagentTable",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/registry.py:_routing_entry",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R19",
+          "description": "Portable Specialist skill_packs and MCP injection across any harness",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/oh_my_raven.py:SkillPackResolver",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        },
+        {
+          "id": "R20",
+          "description": "Active CTO strategic alignment gate and cross-workstream synergy propagation",
+          "status": "met",
+          "entrypoint_caller": "raven/agent/subagent/oh_my_raven.py:CtoAlignmentGate",
+          "e2e_command": "pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts=\"\" -q",
+          "evidence_ref": "docs/specialist_mvp_experiment_report.json"
+        }
+      ],
+      "unmet_requirements": [],
+      "deferred_requirements": []
+    }
+  },
+  "experiment_6_decoupled_specialist_and_cto_gate": {
+    "specialist_command": "",
+    "specialist_hardcoded_routes": [],
+    "discovered_harnesses_initial": [
+      "Raven-Code",
+      "Raven-Design",
+      "Raven-Oncall",
+      "Raven-PPT",
+      "Raven-Research",
+      "HarnessOne",
+      "HarnessTwo"
+    ],
+    "discovered_harnesses_after_onboarding_h3": [
+      "Raven-Code",
+      "Raven-Design",
+      "Raven-Oncall",
+      "Raven-PPT",
+      "Raven-Research",
+      "HarnessOne",
+      "HarnessTwo",
+      "HarnessThree"
+    ],
+    "portable_skill_packs_in_bundle": true,
+    "cto_strategic_brief_validated": true,
+    "cto_guidance_preview": "[BEGIN CTO STRATEGIC BRIEF]\nLong-Term Goal Alignment: 100% decoupling of Specialists (microservices) from Harnesses (VMs)\nCross-Workstream Synergies: t18: Harness-free specialists run on any available runtime harness; t7: Portable skill_packs (superpowers, ecc, mattpocock) injected at runtime\nCross-Project Dependencies: raven.config.schema; raven.agent.subagent.registry\nBlast Radius: subagent orchestration layer\nRollback Plan: git revert\n[END CTO STRATEGIC BRIEF]"
+  }
+}
