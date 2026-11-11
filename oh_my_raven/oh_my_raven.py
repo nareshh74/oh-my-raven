@@ -259,6 +259,10 @@ class PrematureCompletionError(RuntimeError):
     """Raised when an AcceptanceReceipt fails the RequirementTraceabilityGate."""
 
 
+class SkillContractViolationError(RuntimeError):
+    """Raised when a specialist omits required skill/tool/MCP execution evidence."""
+
+
 @dataclass(frozen=True)
 class CommandReceipt:
     command: str
@@ -302,6 +306,133 @@ class SliceReceipt:
     changed_paths: tuple[str, ...] = ()
     committed: bool = True
     tests: tuple[CommandReceipt, ...] = ()
+    invoked_tools: tuple[str, ...] = ()
+    invoked_mcps: tuple[str, ...] = ()
+    skill_packs_injected: tuple[str, ...] = ()
+    skill_evidence: dict[str, CommandReceipt] = field(default_factory=dict)
+
+
+class SkillAndToolReceiptGate:
+    """Fail-closed gate verifying a specialist actually invoked its required skills, tools, and MCP servers."""
+
+    @classmethod
+    def extract_evidence(
+        cls,
+        agent_backend: Any,
+        result: str = "",
+        *,
+        spec_def: SpecialistDefinition | None = None,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], dict[str, CommandReceipt]]:
+        invoked_tools_raw = getattr(agent_backend, "last_invoked_tools", None)
+        invoked_mcps_raw = getattr(agent_backend, "last_invoked_mcps", None)
+        skill_ev_raw = getattr(agent_backend, "last_skill_evidence", None)
+        if result and (invoked_tools_raw is None or invoked_mcps_raw is None or skill_ev_raw is None):
+            try:
+                loaded = json.loads(result)
+            except (TypeError, ValueError):
+                loaded = None
+            if isinstance(loaded, dict):
+                if invoked_tools_raw is None:
+                    invoked_tools_raw = getattr(loaded, "get")("invoked_tools") or ()
+                if invoked_mcps_raw is None:
+                    invoked_mcps_raw = getattr(loaded, "get")("invoked_mcps") or ()
+                if skill_ev_raw is None:
+                    skill_ev_raw = getattr(loaded, "get")("skill_evidence") or {}
+
+        invoked_tools = tuple(str(t) for t in (invoked_tools_raw or ()) if str(t))
+        invoked_mcps = tuple(str(m) for m in (invoked_mcps_raw or ()) if str(m))
+        skill_packs = tuple(spec_def.skill_packs) if spec_def is not None else ()
+        skill_evidence: dict[str, CommandReceipt] = {}
+        if isinstance(skill_ev_raw, dict):
+            for k, v in skill_ev_raw.items():
+                if isinstance(v, CommandReceipt):
+                    skill_evidence[str(k)] = v
+                elif isinstance(v, dict):
+                    skill_evidence[str(k)] = CommandReceipt(
+                        command=str(v.get("command", "")),
+                        exit_code=int(v.get("exit_code", 0)),
+                        output_ref=str(v.get("output_ref", "")),
+                    )
+                elif isinstance(v, str):
+                    skill_evidence[str(k)] = CommandReceipt(command=v, exit_code=0)
+        return invoked_tools, invoked_mcps, skill_packs, skill_evidence
+
+    @classmethod
+    def verify_specialist_execution(
+        cls,
+        node: Any,
+        agent_backend: Any,
+        result: str = "",
+        *,
+        delivered_prompt: str = "",
+        require_skill_evidence: bool = False,
+        required_skill_packs: Sequence[str] = (),
+        required_tools: Sequence[str] = (),
+        required_mcps: Sequence[str] = (),
+    ) -> SliceReceipt | dict[str, Any]:
+        spec_def_raw = getattr(agent_backend, "specialist_definition", None) or getattr(
+            node, "specialist_definition", None
+        )
+        spec_def = SpecialistDefinition.from_obj(spec_def_raw) if spec_def_raw is not None else None
+        invoked_tools, invoked_mcps, skill_packs, skill_evidence = cls.extract_evidence(
+            agent_backend, result, spec_def=spec_def
+        )
+        effective_require = (
+            require_skill_evidence
+            or bool(getattr(agent_backend, "require_skill_evidence", False))
+            or bool(getattr(node, "require_skill_evidence", False))
+            or bool(required_skill_packs)
+            or bool(required_tools)
+            or bool(required_mcps)
+        )
+        if not effective_require:
+            return {
+                "invoked_tools": invoked_tools,
+                "invoked_mcps": invoked_mcps,
+                "skill_packs_injected": skill_packs,
+                "skill_evidence": skill_evidence,
+            }
+
+        expected_packs = tuple(required_skill_packs) or (spec_def.skill_packs if spec_def is not None else ())
+        expected_mcps = tuple(required_mcps) or (spec_def.mcp_servers if spec_def is not None else ())
+        expected_tools = tuple(required_tools) or tuple(getattr(agent_backend, "required_tools", ()) or ())
+
+        if delivered_prompt and spec_def is not None and spec_def.has_specialist_bundle:
+            if "[BEGIN SPECIALIST BUNDLE:" not in delivered_prompt:
+                raise SkillContractViolationError(
+                    f"Node '{getattr(node, 'id', '')}' missing [BEGIN SPECIALIST BUNDLE] in delivered prompt"
+                )
+
+        for pack in expected_packs:
+            rec = skill_evidence.get(pack)
+            if rec is None or not rec.command.strip() or rec.exit_code != 0:
+                raise SkillContractViolationError(
+                    f"Specialist on node '{getattr(node, 'id', '')}' failed closed: missing or non-zero CommandReceipt for required skill pack '{pack}'"
+                )
+
+        for mcp in expected_mcps:
+            if mcp not in invoked_mcps:
+                raise SkillContractViolationError(
+                    f"Specialist on node '{getattr(node, 'id', '')}' failed closed: required MCP server '{mcp}' was not invoked (invoked_mcps={invoked_mcps})"
+                )
+
+        for tool in expected_tools:
+            if tool not in invoked_tools:
+                raise SkillContractViolationError(
+                    f"Specialist on node '{getattr(node, 'id', '')}' failed closed: required tool '{tool}' was not invoked (invoked_tools={invoked_tools})"
+                )
+
+        if not skill_evidence and not invoked_tools and not invoked_mcps:
+            raise SkillContractViolationError(
+                f"Specialist on node '{getattr(node, 'id', '')}' failed closed: require_skill_evidence=True but no skill_evidence, invoked_tools, or invoked_mcps were recorded"
+            )
+
+        return {
+            "invoked_tools": invoked_tools,
+            "invoked_mcps": invoked_mcps,
+            "skill_packs_injected": skill_packs,
+            "skill_evidence": skill_evidence,
+        }
 
 
 @dataclass(frozen=True)
@@ -805,6 +936,11 @@ class WorktreeManager:
         base_sha: str,
         file_scope: Sequence[str],
         tests: Sequence[CommandReceipt] = (),
+        *,
+        invoked_tools: Sequence[str] = (),
+        invoked_mcps: Sequence[str] = (),
+        skill_packs_injected: Sequence[str] = (),
+        skill_evidence: dict[str, CommandReceipt] | None = None,
     ) -> SliceReceipt:
         paths = self.verify_worktree_scope(worktree_path, base_sha, file_scope)
         self.verify_clean_baseline(worktree_path)
@@ -816,6 +952,10 @@ class WorktreeManager:
             tuple(paths),
             True,
             tuple(tests),
+            tuple(str(t) for t in invoked_tools if str(t)),
+            tuple(str(m) for m in invoked_mcps if str(m)),
+            tuple(str(s) for s in skill_packs_injected if str(s)),
+            dict(skill_evidence or {}),
         )
 
     def integrate_slices(
@@ -1143,6 +1283,7 @@ def build_autonomous_feature_delivery_playbook() -> Any:
 
 
 _SECRET = re.compile(r"sk-[A-Za-z0-9_-]+|ghp_[A-Za-z0-9]+|Bearer\s+\S+|api[_-]?key\s*[:=]\s*\S+", re.IGNORECASE)
+_PINNED_INVARIANT_MARKER = re.compile(r"(\[GLOBAL INVARIANT\]|\[ARCH-DEC-[^\]]*\]|\bPINNED\s*:)", re.IGNORECASE)
 
 
 def build_context_charter(
@@ -1151,6 +1292,7 @@ def build_context_charter(
     memories: Sequence[str] = (),
     hot_md_path: Path | None = None,
     everos_fetcher: Callable[[str], Sequence[str]] | None = None,
+    pinned_invariants: Sequence[str] = (),
     max_chars: int = 2000,
 ) -> str:
     items = list(memories)
@@ -1170,7 +1312,26 @@ def build_context_charter(
         if hot_text:
             items.append(hot_text)
     terms = {term.lower() for term in re.findall(r"[A-Za-z0-9_]+", task) if len(term) > 2}
-    relevant = [item for item in items if terms and terms.intersection(re.findall(r"[A-Za-z0-9_]+", item.lower()))]
+    relevant: list[str] = []
+    seen_lines: set[str] = set()
+
+    def _add_item(text: str) -> None:
+        cleaned = text.strip()
+        if cleaned and cleaned not in seen_lines:
+            seen_lines.add(cleaned)
+            relevant.append(cleaned)
+
+    for inv in pinned_invariants or ():
+        if str(inv).strip():
+            _add_item(str(inv))
+
+    for item in items:
+        for line in str(item).splitlines():
+            if _PINNED_INVARIANT_MARKER.search(line):
+                _add_item(line)
+        if terms and terms.intersection(re.findall(r"[A-Za-z0-9_]+", str(item).lower())):
+            _add_item(str(item))
+
     if not relevant:
         return ""
     body = _SECRET.sub("[REDACTED]", "\n".join(relevant))[:max_chars]
@@ -1337,6 +1498,11 @@ class DagSpecialistRuntime:
             any(n.execution_kind in _SPECIAL_KINDS for n in spec.nodes)
             or bool(self.charter_context)
             or self.expected_requirement_ids is not None
+            or any(
+                bool(getattr(self.node_backends.get(n.id), "require_skill_evidence", False))
+                or bool(getattr(self.node_backends.get(n.id), "specialist_definition", None))
+                for n in spec.nodes
+            )
         )
         if not self.enabled:
             return
@@ -1411,6 +1577,7 @@ class DagSpecialistRuntime:
         if not ctx:
             return out
         memories = ctx.get("memories") or ()
+        pinned_invariants = ctx.get("pinned_invariants") or ()
         hot_md_path = ctx.get("hot_md_path")
         if isinstance(hot_md_path, str) and hot_md_path:
             hot_md_path = Path(hot_md_path)
@@ -1422,6 +1589,7 @@ class DagSpecialistRuntime:
             memories=memories,
             hot_md_path=hot_md_path if isinstance(hot_md_path, Path) else None,
             everos_fetcher=everos_fetcher if callable(everos_fetcher) else None,
+            pinned_invariants=pinned_invariants,
             max_chars=max_chars,
         )
         if not charter:
@@ -1577,10 +1745,53 @@ class DagSpecialistRuntime:
     ) -> None:
         if not self.enabled:
             return
+        evidence_info = SkillAndToolReceiptGate.verify_specialist_execution(
+            node,
+            agent_backend,
+            result,
+            require_skill_evidence=bool(getattr(self, "require_skill_evidence", False)),
+        )
+        ev_dict = evidence_info if isinstance(evidence_info, dict) else {}
         if node.execution_kind == "write" and node.id in self.node_worktrees:
+            skill_ev: dict[str, CommandReceipt] = dict(ev_dict.get("skill_evidence") or {})
+            extra_tests = tuple(skill_ev.values())
             self.slice_receipts[node.id] = WorktreeManager().build_slice_receipt(
-                self.node_worktrees[node.id], node.id, self.base_sha, node.file_scope
+                self.node_worktrees[node.id],
+                node.id,
+                self.base_sha,
+                node.file_scope,
+                tests=extra_tests,
+                invoked_tools=tuple(ev_dict.get("invoked_tools") or ()),
+                invoked_mcps=tuple(ev_dict.get("invoked_mcps") or ()),
+                skill_packs_injected=tuple(ev_dict.get("skill_packs_injected") or ()),
+                skill_evidence=skill_ev,
             )
+        elif node.execution_kind == "integrate":
+            integ_sha = ""
+            if result:
+                try:
+                    parsed_int = json.loads(result)
+                except (TypeError, ValueError):
+                    parsed_int = None
+                if isinstance(parsed_int, dict) and parsed_int.get("integrated_head_sha"):
+                    integ_sha = str(parsed_int["integrated_head_sha"]).strip()
+            if not integ_sha and self.workdir and (Path(self.workdir) / ".git").exists():
+                integ_sha = _git(Path(self.workdir), "rev-parse", "HEAD").stdout.strip()
+            if integ_sha and (not self.base_sha or integ_sha != self.base_sha):
+                skill_ev_int: dict[str, CommandReceipt] = dict(ev_dict.get("skill_evidence") or {})
+                self.slice_receipts[node.id] = SliceReceipt(
+                    node_id=node.id,
+                    head_sha=integ_sha,
+                    base_sha=self.base_sha or "",
+                    worktree_path=str(self.workdir),
+                    changed_paths=(),
+                    committed=True,
+                    tests=tuple(skill_ev_int.values()),
+                    invoked_tools=tuple(ev_dict.get("invoked_tools") or ()),
+                    invoked_mcps=tuple(ev_dict.get("invoked_mcps") or ()),
+                    skill_packs_injected=tuple(ev_dict.get("skill_packs_injected") or ()),
+                    skill_evidence=skill_ev_int,
+                )
         elif node.execution_kind == "plan":
             is_cto = (
                 CtoAlignmentGate.is_cto_node(node)
@@ -1613,7 +1824,12 @@ class DagSpecialistRuntime:
             if isinstance(backend_max_cycles, int) and self.cycle_tracker is not None:
                 self.cycle_tracker.max_cycles = backend_max_cycles
             authors, writers = self._authors(node, by_id, node_backends)
-            heads = [self.slice_receipts[w].head_sha for w in writers if w in self.slice_receipts]
+            direct_heads = [
+                self.slice_receipts[d].head_sha
+                for d in getattr(node, "depends_on", ())
+                if d in self.slice_receipts
+            ]
+            heads = direct_heads or [self.slice_receipts[w].head_sha for w in writers if w in self.slice_receipts]
             manifest_expected_ids = self.expected_requirement_ids
             if manifest_expected_ids is None:
                 for candidate_dir in (self.run_dir, Path(self.workdir) if self.workdir else None):
@@ -1635,14 +1851,16 @@ class DagSpecialistRuntime:
             else:
                 expected_ids = backend_expected_ids
             require_acc = (
-                self.require_acceptance_receipt
-                or bool(getattr(agent_backend, "require_acceptance_receipt", False))
-                or expected_ids is not None
-                or receipt.acceptance_receipt is not None
-            )
+                receipt.verdict == "approved"
+                and (
+                    self.require_acceptance_receipt
+                    or bool(getattr(agent_backend, "require_acceptance_receipt", False))
+                    or expected_ids is not None
+                )
+            ) or receipt.acceptance_receipt is not None
             ReviewGateValidator().verify_review_receipt(
                 receipt,
-                candidate_head_sha=heads[-1] if heads else (self.base_sha or receipt.reviewed_head_sha),
+                candidate_head_sha=heads[0] if direct_heads else (heads[-1] if heads else (self.base_sha or receipt.reviewed_head_sha)),
                 reviewer_backend=getattr(agent_backend, "execution_identity", None)
                 or ExecutionIdentity(agent_name=node.subagent),
                 author_backends=authors,
@@ -1651,7 +1869,7 @@ class DagSpecialistRuntime:
                 run_id=self.run_id,
                 ocr_available=bool(getattr(agent_backend, "ocr_available", False)),
                 require_acceptance_receipt=require_acc,
-                expected_requirement_ids=expected_ids,
+                expected_requirement_ids=expected_ids if require_acc else None,
                 repo_root=Path(self.workdir) if self.workdir else None,
             )
 
@@ -1659,13 +1877,27 @@ class DagSpecialistRuntime:
         if not self.enabled or isinstance(exc, (asyncio.CancelledError, RecoveryBlockedError)):
             return
         if self.ledger is not None:
+            dirty_paths: list[str] = []
+            for r in getattr(exc, "attempt_receipts", ()) or ():
+                if isinstance(r, dict) and r.get("dirty_paths"):
+                    dirty_paths.extend(str(p) for p in r["dirty_paths"])
+            wt_path = self.node_worktrees.get(node.id)
+            if not dirty_paths and wt_path is not None and wt_path.exists():
+                try:
+                    dirty_paths = _nul_paths(
+                        _git(wt_path, "status", "--porcelain=v1", "-z", "-uall", check=False).stdout,
+                        status=True,
+                    )
+                except Exception:
+                    dirty_paths = []
             self.ledger.record_attempt(
                 run_id=self.run_id,
                 node_id=node.id,
                 input_hash=self._hash(prompt),
                 backend=node.subagent,
                 failure_class=type(exc).__name__,
-                worktree_path=str(self.node_worktrees.get(node.id, "")),
+                worktree_path=str(wt_path or ""),
+                dirty_paths=dirty_paths,
             )
 
     async def persist(self, store: Any) -> None:
@@ -1673,6 +1905,644 @@ class DagSpecialistRuntime:
             await store.write_text(
                 store.run_dir + "/recovery_ledger.json", self.ledger.ledger_path.read_text(encoding="utf-8")
             )
+
+
+QueueStatus = Literal["enqueued", "routed", "decomposing", "running", "completed", "failed"]
+
+
+@dataclass(frozen=True)
+class OmrQueueEntry:
+    """Durable record in ``queue_ledger.jsonl`` tracking top-level and decomposed child tasks."""
+
+    seq_id: int
+    task_id: str
+    parent_task_id: str | None
+    prompt: str
+    assigned_specialist: str = ""
+    assigned_harness: str = ""
+    wave: int = 0
+    status: QueueStatus = "enqueued"
+    timestamp: str = ""
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "seq_id": int(self.seq_id),
+            "task_id": str(self.task_id),
+            "parent_task_id": self.parent_task_id,
+            "prompt": _SECRET.sub("[REDACTED]", str(self.prompt)),
+            "assigned_specialist": str(self.assigned_specialist),
+            "assigned_harness": str(self.assigned_harness),
+            "wave": int(self.wave),
+            "status": str(self.status),
+            "timestamp": str(self.timestamp),
+            "error": str(self.error),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "OmrQueueEntry":
+        return cls(
+            seq_id=int(data.get("seq_id", 0)),
+            task_id=str(data.get("task_id", "")),
+            parent_task_id=data.get("parent_task_id"),
+            prompt=str(data.get("prompt", "")),
+            assigned_specialist=str(data.get("assigned_specialist", "")),
+            assigned_harness=str(data.get("assigned_harness", "")),
+            wave=int(data.get("wave", 0)),
+            status=data.get("status", "enqueued"),
+            timestamp=str(data.get("timestamp", "")),
+            error=str(data.get("error", "")),
+        )
+
+
+class OmrTaskQueue:
+    """Durable JSONL-backed task queue (``queue_ledger.jsonl``) with atomic file-locked appends."""
+
+    def __init__(self, ledger_path: Path | str) -> None:
+        self.ledger_path = Path(ledger_path)
+
+    @property
+    def lock_path(self) -> Path:
+        return self.ledger_path.with_name(f"{self.ledger_path.name}.lock")
+
+    def _acquire_file_lock(self, lock_fh: Any) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_fh.seek(0, os.SEEK_END)
+            if lock_fh.tell() == 0:
+                lock_fh.write(b"\0")
+                lock_fh.flush()
+            lock_fh.seek(0)
+            msvcrt.locking(lock_fh.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+
+    def _release_file_lock(self, lock_fh: Any) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_fh.seek(0)
+            msvcrt.locking(lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+    def _now_iso(self) -> str:
+        from datetime import datetime, timezone
+
+        return datetime.now(timezone.utc).isoformat()
+
+    def _append_entry_unlocked(self, entry: OmrQueueEntry) -> OmrQueueEntry:
+        line = (json.dumps(entry.to_dict(), ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8")
+        with self.ledger_path.open("ab") as fh:
+            fh.write(line)
+            fh.flush()
+        return entry
+
+    def _read_entries_unlocked(self) -> list[OmrQueueEntry]:
+        if not self.ledger_path.exists():
+            return []
+        entries: list[OmrQueueEntry] = []
+        for raw_line in self.ledger_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            try:
+                data = json.loads(stripped)
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                entries.append(OmrQueueEntry.from_dict(data))
+        return entries
+
+    def entries(self) -> list[OmrQueueEntry]:
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+b") as lock_fh:
+            self._acquire_file_lock(lock_fh)
+            try:
+                return self._read_entries_unlocked()
+            finally:
+                self._release_file_lock(lock_fh)
+
+    def latest_by_task(self) -> dict[str, OmrQueueEntry]:
+        latest: dict[str, OmrQueueEntry] = {}
+        for item in self.entries():
+            latest[item.task_id] = item
+        return latest
+
+    def enqueue(
+        self,
+        task_id: str,
+        prompt: str,
+        *,
+        parent_task_id: str | None = None,
+        assigned_specialist: str = "",
+        assigned_harness: str = "",
+        wave: int = 0,
+        status: QueueStatus = "enqueued",
+    ) -> OmrQueueEntry:
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+b") as lock_fh:
+            self._acquire_file_lock(lock_fh)
+            try:
+                existing = self._read_entries_unlocked()
+                next_seq = (max((e.seq_id for e in existing), default=0)) + 1
+                entry = OmrQueueEntry(
+                    seq_id=next_seq,
+                    task_id=str(task_id),
+                    parent_task_id=parent_task_id,
+                    prompt=str(prompt),
+                    assigned_specialist=str(assigned_specialist),
+                    assigned_harness=str(assigned_harness),
+                    wave=int(wave),
+                    status=status,
+                    timestamp=self._now_iso(),
+                )
+                return self._append_entry_unlocked(entry)
+            finally:
+                self._release_file_lock(lock_fh)
+
+    def transition(
+        self,
+        task_id: str,
+        status: QueueStatus,
+        *,
+        assigned_specialist: str | None = None,
+        assigned_harness: str | None = None,
+        wave: int | None = None,
+        error: str = "",
+    ) -> OmrQueueEntry:
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+b") as lock_fh:
+            self._acquire_file_lock(lock_fh)
+            try:
+                existing = self._read_entries_unlocked()
+                next_seq = (max((e.seq_id for e in existing), default=0)) + 1
+                prev = next((e for e in reversed(existing) if e.task_id == task_id), None)
+                entry = OmrQueueEntry(
+                    seq_id=next_seq,
+                    task_id=str(task_id),
+                    parent_task_id=prev.parent_task_id if prev is not None else None,
+                    prompt=prev.prompt if prev is not None else "",
+                    assigned_specialist=(
+                        str(assigned_specialist)
+                        if assigned_specialist is not None
+                        else (prev.assigned_specialist if prev is not None else "")
+                    ),
+                    assigned_harness=(
+                        str(assigned_harness)
+                        if assigned_harness is not None
+                        else (prev.assigned_harness if prev is not None else "")
+                    ),
+                    wave=int(wave) if wave is not None else (prev.wave if prev is not None else 0),
+                    status=status,
+                    timestamp=self._now_iso(),
+                    error=str(error),
+                )
+                return self._append_entry_unlocked(entry)
+            finally:
+                self._release_file_lock(lock_fh)
+
+
+@dataclass(frozen=True)
+class DecompositionPlan:
+    """Validated dynamic task decomposition produced by the Lead Specialist (Manager)."""
+
+    dag_spec: Any
+    expected_requirement_ids: tuple[str, ...]
+    node_waves: dict[str, int]
+    manifest_path: Path | None = None
+
+
+class DynamicDecompositionGate:
+    """Validates a Lead Specialist's dynamic DAG decomposition and enqueues child tasks into ``OmrTaskQueue``."""
+
+    @staticmethod
+    def compute_topological_waves(nodes: Sequence[DagNodeSpec]) -> dict[str, int]:
+        by_id = {n.id: n for n in nodes}
+        memo: dict[str, int] = {}
+        visiting: set[str] = set()
+
+        def _wave(nid: str) -> int:
+            if nid in memo:
+                return memo[nid]
+            if nid in visiting:
+                raise DagValidationError(f"cycle detected involving node {nid!r}")
+            visiting.add(nid)
+            node = by_id.get(nid)
+            deps = [d for d in (getattr(node, "depends_on", ()) if node is not None else ()) if d in by_id]
+            w = 0 if not deps else 1 + max(_wave(d) for d in deps)
+            visiting.remove(nid)
+            memo[nid] = w
+            return w
+
+        for n in nodes:
+            _wave(n.id)
+        return memo
+
+    @classmethod
+    def parse_decomposition(cls, plan_payload: Any, *, default_summary: str = "decomposed oh-my-raven workflow") -> tuple[Any, list[str]]:
+        from raven.agent.subagent.dag_graph import SubAgentDagSpec, parse_dag_spec
+
+        if isinstance(plan_payload, SubAgentDagSpec):
+            return plan_payload, []
+        if isinstance(plan_payload, str):
+            try:
+                loaded_payload = json.loads(plan_payload)
+            except ValueError as exc:
+                raise DagValidationError(f"Decomposition payload is not valid JSON: {exc}") from exc
+        elif isinstance(plan_payload, dict):
+            loaded_payload = dict(plan_payload)
+        else:
+            raise DagValidationError(f"Unsupported decomposition payload type: {type(plan_payload).__name__}")
+
+        if not isinstance(loaded_payload, dict):
+            raise DagValidationError("Decomposition payload must be a JSON object")
+
+        read_field = getattr(loaded_payload, "get")
+        req_ids_raw = read_field("expected_requirement_ids")
+        manifest_obj = read_field("requirements_manifest")
+        if req_ids_raw is None and isinstance(manifest_obj, dict):
+            req_ids_raw = manifest_obj.get("expected_requirement_ids")
+        expected_ids = [str(x).strip() for x in (req_ids_raw or ()) if str(x).strip()]
+
+        nested_dag = read_field("dag_spec")
+        confirm_val = read_field("confirm")
+        dag_raw = nested_dag if isinstance(nested_dag, dict) else {
+            "task_summary": read_field("task_summary") or default_summary,
+            "nodes": read_field("nodes") or [],
+            **({"confirm": confirm_val} if confirm_val is not None else {}),
+        }
+        dag_spec = parse_dag_spec(dag_raw)
+        return dag_spec, expected_ids
+
+    @classmethod
+    def validate_and_enqueue(
+        cls,
+        plan_payload: Any,
+        queue: OmrTaskQueue,
+        parent_task_id: str,
+        run_dir: Path | str | None = None,
+        *,
+        workdir: Path | str | None = None,
+        require_cto_and_review: bool = True,
+    ) -> DecompositionPlan:
+        from raven.agent.subagent.dag_graph import validate_and_order
+
+        dag_spec, expected_ids = cls.parse_decomposition(plan_payload)
+        roots = (str(workdir),) if workdir else ()
+        validate_and_order(dag_spec, roots)
+
+        struct_errors = ReviewGateValidator().validate_workflow_structure(dag_spec.nodes)
+        if struct_errors:
+            raise DagValidationError("; ".join(struct_errors))
+
+        if require_cto_and_review:
+            has_cto = any(CtoAlignmentGate.is_cto_node(n) for n in dag_spec.nodes)
+            has_integrate = any(n.execution_kind == "integrate" for n in dag_spec.nodes)
+            has_review = any(n.execution_kind == "review" for n in dag_spec.nodes)
+            if not (has_cto and has_integrate and has_review):
+                missing_parts = [
+                    name
+                    for name, ok in (("cto/plan", has_cto), ("integrate", has_integrate), ("review", has_review))
+                    if not ok
+                ]
+                raise DagValidationError(
+                    f"Decomposed workflow missing mandatory oh-my-raven governance nodes: {', '.join(missing_parts)}"
+                )
+
+        manifest_path: Path | None = None
+        if expected_ids:
+            for target_dir in (run_dir, workdir):
+                if target_dir is not None:
+                    mpath = Path(target_dir) / "requirements_manifest.json"
+                    _write_json(mpath, {"expected_requirement_ids": expected_ids})
+                    if manifest_path is None:
+                        manifest_path = mpath
+
+        waves = cls.compute_topological_waves(dag_spec.nodes)
+        ordered_nodes = sorted(dag_spec.nodes, key=lambda n: (waves.get(n.id, 0), n.id))
+        for node in ordered_nodes:
+            queue.enqueue(
+                node.id,
+                node.prompt_template,
+                parent_task_id=parent_task_id,
+                assigned_specialist=node.subagent,
+                wave=waves.get(node.id, 0),
+                status="enqueued",
+            )
+
+        return DecompositionPlan(
+            dag_spec=dag_spec,
+            expected_requirement_ids=tuple(expected_ids),
+            node_waves=waves,
+            manifest_path=manifest_path,
+        )
+
+
+@dataclass
+class OmrDispatchResult:
+    """End-to-end result of submitting a top-level complex task to ``OmrDispatcher``."""
+
+    task_id: str
+    lead_specialist: str
+    cto_specialist: str
+    cto_brief: CtoStrategicBrief | None
+    decomposition_plan: DecompositionPlan
+    dag_result: Any
+    queue_entries: list[OmrQueueEntry]
+    integrated_head_sha: str = ""
+
+
+class OmrDispatcher:
+    """Top-level oh-my-raven intake dispatcher: enqueues raw tasks, routes to CTO + Manager, decomposes, and runs the DAG."""
+
+    def __init__(
+        self,
+        *,
+        table: Any,
+        queue: OmrTaskQueue,
+        workdir: Path | str,
+        run_root: Path | str,
+        nodes_root: Path | str,
+        history_root: Path | str,
+        intake_router: Callable[[list[tuple[str, str]], str, str], Any] | None = None,
+        charter_context: dict[str, Any] | None = None,
+    ) -> None:
+        self.table = table
+        self.queue = queue
+        self.workdir = Path(workdir)
+        self.run_root = Path(run_root)
+        self.nodes_root = Path(nodes_root)
+        self.history_root = Path(history_root)
+        self.intake_router = intake_router
+        self.charter_context = dict(charter_context) if charter_context else None
+
+    async def route_intake_specialist(self, prompt: str, *, default: str = "Manager") -> str:
+        menu = [(row.name, row.description) for row in self.table.enabled() if not row.is_harness or row.kind == "specialist"]
+        if not menu:
+            menu = [(row.name, row.description) for row in self.table.enabled()]
+        if self.intake_router is not None and menu:
+            ans = self.intake_router(menu, prompt, default)
+            if asyncio.iscoroutine(ans) or isinstance(ans, asyncio.Future):
+                ans = await ans
+            if isinstance(ans, str) and any(name == ans for name, _ in menu):
+                return ans
+        for name, _ in menu:
+            if name.lower() == default.lower():
+                return name
+        return default
+
+    def _build_framed_prompt(self, prompt: str) -> str:
+        if not self.charter_context:
+            return prompt
+        hot_md = self.charter_context.get("hot_md_path")
+        charter_block = build_context_charter(
+            prompt,
+            memories=self.charter_context.get("memories") or (),
+            hot_md_path=Path(hot_md) if hot_md else None,
+            everos_fetcher=self.charter_context.get("everos_fetcher"),
+            pinned_invariants=self.charter_context.get("pinned_invariants") or (),
+            max_chars=int(self.charter_context.get("max_chars", 2000)),
+        )
+        return f"{charter_block}\n\n{prompt}" if charter_block else prompt
+
+    def _cleanup_run_worktrees(self, effective_run_id: str) -> None:
+        if not (self.workdir / ".git").exists():
+            return
+        wt_root = self.workdir.parent / f"{self.workdir.name}.worktrees"
+        if not wt_root.exists():
+            return
+        for wt_child in list(wt_root.iterdir()):
+            if wt_child.is_dir() and wt_child.name.startswith(f"{effective_run_id}-"):
+                _git(self.workdir, "worktree", "remove", "--force", str(wt_child), check=False)
+        _git(self.workdir, "worktree", "prune", check=False)
+        if wt_root.exists() and not any(wt_root.iterdir()):
+            shutil.rmtree(wt_root, ignore_errors=True)
+
+    @staticmethod
+    async def _default_dag_judge(
+        *,
+        node: DagNodeSpec,
+        store: Any,
+        output: str,
+        error: str,
+        crashed: bool,
+        output_limited: bool = False,
+    ) -> Any:
+        from raven.agent.subagent.dag_verdict import Verdict
+
+        if crashed:
+            return Verdict(accomplished=False, what_is_missing=error or "node crashed")
+        if node.routes:
+            selected: list[str] = []
+            try:
+                parsed = json.loads(output)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("verdict") in node.routes:
+                selected = [str(parsed["verdict"])]
+            if not selected:
+                for rname in node.routes:
+                    if rname in output:
+                        selected = [rname]
+                        break
+            if not selected:
+                selected = [next(iter(node.routes))]
+            return Verdict(accomplished=True, routes=selected, route_evidence=output[:200])
+        return Verdict(accomplished=True)
+
+    async def _execute_decomposed_dag(
+        self,
+        plan: DecompositionPlan,
+        *,
+        effective_run_id: str,
+        session_key: str | None,
+        sandbox_factory: Callable[[Path], Any] | None,
+        judge_node: Callable[..., Any] | None,
+    ) -> Any:
+        from raven.agent.subagent.dag_runner import run_dag
+        from raven.agent.subagent.prompt_backend import LocalFileBackend
+
+        node_waves = plan.node_waves
+        by_id = {n.id: n for n in plan.dag_spec.nodes}
+        for node in plan.dag_spec.nodes:
+            self.queue.transition(
+                node.id,
+                "routed",
+                assigned_specialist=node.subagent,
+                wave=node_waves.get(node.id, 0),
+            )
+
+        def _resolve_from_table(node: DagNodeSpec) -> Any:
+            resolved = self.table.backend(node.subagent, build=node)
+            if resolved is not None and self.charter_context:
+                setattr(resolved, "charter_context", self.charter_context)
+            return resolved
+
+        async def _on_node_start(nid: str) -> None:
+            node_obj = by_id.get(nid)
+            self.queue.transition(
+                nid,
+                "running",
+                assigned_specialist=node_obj.subagent if node_obj else "",
+                wave=node_waves.get(nid, 0),
+            )
+
+        async def _progress_pub(event_name: str, payload: dict[str, Any]) -> None:
+            if event_name == "dag_node_updated":
+                nid = str(payload.get("node") or "")
+                st = str(payload.get("status") or "")
+                if nid in by_id and st in ("completed", "failed"):
+                    node_obj = by_id[nid]
+                    b_obj = self.table.backend(node_obj.subagent)
+                    h_name = str(getattr(b_obj, "last_chosen_backend", "") or "")
+                    self.queue.transition(
+                        nid,
+                        "completed" if st == "completed" else "failed",
+                        assigned_specialist=node_obj.subagent,
+                        assigned_harness=h_name,
+                        wave=node_waves.get(nid, 0),
+                    )
+
+        return await run_dag(
+            plan.dag_spec,
+            resolve=_resolve_from_table,
+            backend=LocalFileBackend(),
+            workdir=str(self.workdir),
+            run_root=str(self.run_root),
+            nodes_root=str(self.nodes_root),
+            history_root=str(self.history_root),
+            run_id=effective_run_id,
+            session_key=session_key,
+            sandbox_factory=sandbox_factory,
+            on_node_start=_on_node_start,
+            progress_publisher=_progress_pub,
+            judge_node=judge_node or self._default_dag_judge,
+        )
+
+    async def submit_task(
+        self,
+        task_id: str,
+        prompt: str,
+        *,
+        run_id: str | None = None,
+        session_key: str | None = "omr-session",
+        sandbox_factory: Callable[[Path], Any] | None = None,
+        judge_node: Callable[..., Any] | None = None,
+        cto_specialist: str = "CTO",
+        lead_specialist: str | None = None,
+        cleanup_worktrees: bool = True,
+    ) -> OmrDispatchResult:
+        effective_run_id = run_id or f"run-{task_id.lower()}"
+        run_dir = self.run_root / effective_run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if self.charter_context:
+            charter_serializable = {
+                k: (str(v) if isinstance(v, Path) else v)
+                for k, v in self.charter_context.items()
+                if k != "everos_fetcher"
+            }
+            _write_json(run_dir / "charter_context.json", charter_serializable)
+
+        self.queue.enqueue(task_id, prompt, parent_task_id=None, status="enqueued")
+        try:
+            chosen_lead = lead_specialist or await self.route_intake_specialist(prompt, default="Manager")
+            self.queue.transition(task_id, "routed", assigned_specialist=chosen_lead)
+            framed_prompt = self._build_framed_prompt(prompt)
+
+            cto_backend = self.table.backend(cto_specialist)
+            intake_cto_brief: CtoStrategicBrief | None = None
+            if cto_backend is not None:
+                cto_out = await cto_backend.run(
+                    framed_prompt,
+                    task_id=f"{task_id}::cto_intake",
+                    workspace=self.workdir,
+                    executor=None,
+                    session_key=session_key,
+                    authored_task=prompt,
+                )
+                intake_cto_brief = DagSpecialistRuntime._cto_brief_from(
+                    cto_backend, cto_out, require_cto_alignment=True
+                )
+
+            manager_backend = self.table.backend(chosen_lead)
+            if manager_backend is None:
+                raise DagValidationError(f"Lead specialist {chosen_lead!r} not found in SubagentTable")
+            manager_input = (
+                f"{intake_cto_brief.render_guidance_block()}\n\n{framed_prompt}"
+                if intake_cto_brief is not None
+                else framed_prompt
+            )
+            decomp_out = await manager_backend.run(
+                manager_input,
+                task_id=f"{task_id}::decompose",
+                workspace=self.workdir,
+                executor=None,
+                session_key=session_key,
+                authored_task=prompt,
+            )
+            chosen_mgr_harness = str(getattr(manager_backend, "last_chosen_backend", "") or "")
+            self.queue.transition(
+                task_id,
+                "decomposing",
+                assigned_specialist=chosen_lead,
+                assigned_harness=chosen_mgr_harness,
+            )
+
+            plan = DynamicDecompositionGate.validate_and_enqueue(
+                decomp_out,
+                self.queue,
+                parent_task_id=task_id,
+                run_dir=run_dir,
+                workdir=self.workdir,
+            )
+            self.queue.transition(
+                task_id,
+                "running",
+                assigned_specialist=chosen_lead,
+                assigned_harness=chosen_mgr_harness,
+            )
+
+            dag_res = await self._execute_decomposed_dag(
+                plan,
+                effective_run_id=effective_run_id,
+                session_key=session_key,
+                sandbox_factory=sandbox_factory,
+                judge_node=judge_node,
+            )
+            any_failed = any(f.get("status") == "failed" for f in dag_res.files)
+            if cleanup_worktrees:
+                self._cleanup_run_worktrees(effective_run_id)
+
+            self.queue.transition(
+                task_id,
+                "failed" if any_failed else "completed",
+                assigned_specialist=chosen_lead,
+                assigned_harness=chosen_mgr_harness,
+            )
+            head_sha = (
+                _git(self.workdir, "rev-parse", "HEAD").stdout.strip()
+                if (self.workdir / ".git").exists()
+                else ""
+            )
+            return OmrDispatchResult(
+                task_id=task_id,
+                lead_specialist=chosen_lead,
+                cto_specialist=cto_specialist,
+                cto_brief=intake_cto_brief,
+                decomposition_plan=plan,
+                dag_result=dag_res,
+                queue_entries=self.queue.entries(),
+                integrated_head_sha=head_sha,
+            )
+        except BaseException as exc:
+            self.queue.transition(task_id, "failed", error=str(exc))
+            raise
 
 
 __all__ = [
@@ -1684,12 +2554,19 @@ __all__ = [
     "CtoAlignmentGate",
     "CtoStrategicBrief",
     "DagSpecialistRuntime",
+    "DecompositionPlan",
     "DirtyBaselineError",
     "DurableRecoveryLedger",
+    "DynamicDecompositionGate",
     "ExecutionIdentity",
     "IndependentReviewError",
     "IntegrationConflictError",
+    "OmrDispatchResult",
+    "OmrDispatcher",
+    "OmrQueueEntry",
+    "OmrTaskQueue",
     "PrematureCompletionError",
+    "QueueStatus",
     "RecoveryBlockedError",
     "RequirementItem",
     "RequirementTraceabilityGate",
@@ -1698,6 +2575,8 @@ __all__ = [
     "ReviewGateValidator",
     "ReviewReceipt",
     "ScopeViolationError",
+    "SkillAndToolReceiptGate",
+    "SkillContractViolationError",
     "SkillPackInjector",
     "SkillPackResolver",
     "SliceReceipt",
