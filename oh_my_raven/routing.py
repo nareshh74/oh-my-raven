@@ -355,6 +355,7 @@ class RoutingBackend(SubagentBackend):
         worktree_dirty_check: Callable[[Path], list[str]] | None = None,
         specialist_definition: Any = None,
         is_dynamic_specialist: bool = False,
+        pool_load_state: dict[str, dict[str, int]] | None = None,
     ) -> None:
         """``targets`` are ``(name, description, backend)`` in route order.
 
@@ -380,6 +381,12 @@ class RoutingBackend(SubagentBackend):
         self._session_dir_resolver: Callable[..., Any] | None = None
         self.specialist_definition = specialist_definition
         self._is_dynamic_specialist = bool(is_dynamic_specialist)
+        if pool_load_state is not None:
+            self._dispatch_counts: dict[str, int] = pool_load_state.setdefault("dispatch_counts", {})
+            self._inflight_counts: dict[str, int] = pool_load_state.setdefault("inflight_counts", {})
+        else:
+            self._dispatch_counts = {}
+            self._inflight_counts = {}
 
     @property
     def streams(self) -> bool:  # type: ignore[override]
@@ -578,13 +585,8 @@ class RoutingBackend(SubagentBackend):
             stats = self._load_telemetry_stats(session_key)
             ordered = sorted(
                 enumerate(self._targets),
-                key=lambda item: (
-                    item[1].priority,
-                    *(
-                        (-score[0], -score[1])
-                        for score in (self._workload_score(item[1].name, session_key=session_key, stats=stats),)
-                    ),
-                    item[0],
+                key=lambda item: self._target_rank_key(
+                    item[0], item[1], session_key=session_key, stats=stats
                 ),
             )
             for _, target in ordered:
@@ -661,6 +663,31 @@ class RoutingBackend(SubagentBackend):
             return (0.0, 0.0)
         return (float(entry.get("success_rate", 0.0)), -float(entry.get("avg_latency_ms", 0.0)))
 
+    def _load_tiebreak_key(self, backend_name: str) -> tuple[int, int]:
+        return (
+            int(self._inflight_counts.get(backend_name, 0)),
+            int(self._dispatch_counts.get(backend_name, 0)),
+        )
+
+    def _target_rank_key(
+        self,
+        declaration_index: int,
+        target: RouteTarget,
+        *,
+        session_key: str | None = None,
+        stats: dict[str, dict[str, float]] | None = None,
+    ) -> tuple[int, float, float, int, int, int]:
+        score = self._workload_score(target.name, session_key=session_key, stats=stats)
+        inflight, dispatches = self._load_tiebreak_key(target.name)
+        return (
+            target.priority,
+            -score[0],
+            -score[1],
+            inflight,
+            dispatches,
+            declaration_index,
+        )
+
     def _iter_candidates(
         self,
         picked: Picked,
@@ -675,13 +702,8 @@ class RoutingBackend(SubagentBackend):
         stats = self._load_telemetry_stats(session_key)
         ordered_targets = sorted(
             enumerate(self._targets),
-            key=lambda item: (
-                item[1].priority,
-                *(
-                    (-score[0], -score[1])
-                    for score in (self._workload_score(item[1].name, session_key=session_key, stats=stats),)
-                ),
-                item[0],
+            key=lambda item: self._target_rank_key(
+                item[0], item[1], session_key=session_key, stats=stats
             ),
         )
         for _, target in ordered_targets:
@@ -787,6 +809,10 @@ class RoutingBackend(SubagentBackend):
         final_status: str,
         primary_model: str = "",
         total_duration_ms: float,
+        skill_packs_injected: Sequence[str] = (),
+        mcp_servers_attached: Sequence[str] = (),
+        context_charter_injected: bool = False,
+        cto_brief_injected: bool = False,
     ) -> None:
         tpath = self._resolve_telemetry_path(session_key)
         if tpath is None:
@@ -805,6 +831,10 @@ class RoutingBackend(SubagentBackend):
             "final_status": final_status,
             "total_duration_ms": round(max(0.0, total_duration_ms), 3),
             "worktree_path": str(workspace) if workspace is not None else "",
+            "skill_packs_injected": [str(s) for s in skill_packs_injected if str(s)],
+            "mcp_servers_attached": [str(m) for m in mcp_servers_attached if str(m)],
+            "context_charter_injected": bool(context_charter_injected),
+            "cto_brief_injected": bool(cto_brief_injected),
         }
         TelemetryLogger(tpath).write_record(record)
 
@@ -829,6 +859,195 @@ class RoutingBackend(SubagentBackend):
             return Picked(self.name, self._primary)
         return None
 
+    def _forward_candidate_attributes(self, candidate_name: str, backend: Any) -> None:
+        self.last_chosen_backend = candidate_name
+        self.last_chosen_backend_obj = backend
+        for receipt_attr in (
+            "last_review_receipt",
+            "last_cto_strategic_brief",
+            "last_cto_brief",
+            "last_consequence_matrix",
+            "last_skill_evidence",
+            "last_invoked_tools",
+            "last_invoked_mcps",
+            "execution_identity",
+            "ocr_available",
+            "expected_requirement_ids",
+            "require_acceptance_receipt",
+        ):
+            if hasattr(backend, receipt_attr):
+                val = getattr(backend, receipt_attr, None)
+                if val is not None:
+                    setattr(self, receipt_attr, val)
+
+    def _prepare_specialist_bundle(
+        self, base_task: str, kwargs: dict[str, Any], call_kwargs: dict[str, Any]
+    ) -> tuple[str, tuple[str, ...], list[str]]:
+        skill_packs_injected: tuple[str, ...] = ()
+        mcp_servers_attached: list[str] = list(kwargs.get("mcps") or [])
+        if self.specialist_definition is not None:
+            from raven.agent.subagent.oh_my_raven import SkillPackResolver, SpecialistDefinition
+
+            spec_def = SpecialistDefinition.from_obj(self.specialist_definition)
+            if spec_def.has_specialist_bundle:
+                base_task = SkillPackResolver.render_specialist_bundle(spec_def, base_task)
+                skill_packs_injected = tuple(spec_def.skill_packs)
+                if spec_def.mcp_servers:
+                    existing_mcps = list(kwargs.get("mcps") or [])
+                    for srv in spec_def.mcp_servers:
+                        if srv not in existing_mcps:
+                            existing_mcps.append(srv)
+                    call_kwargs["mcps"] = existing_mcps
+                    mcp_servers_attached = list(existing_mcps)
+        return base_task, skill_packs_injected, mcp_servers_attached
+
+    def _verify_write_failover_safety(
+        self,
+        *,
+        candidate: Picked,
+        cleaned: bool,
+        idempotent: bool,
+        error_class: str,
+        duration_ms: float,
+        attempt_records: list[dict[str, Any]],
+        session_key: str | None,
+        task_id: str,
+        workspace: Path,
+        call_kwargs: dict[str, Any],
+        first_model: str,
+        run_start: float,
+        telemetry_extra: dict[str, Any],
+        exc: BaseException,
+    ) -> None:
+        has_cleanup_hook = callable(getattr(candidate.backend, "cleanup_attempt", None)) or callable(
+            getattr(candidate.backend, "cancel", None)
+        )
+        if has_cleanup_hook and not cleaned:
+            receipt = {
+                "backend": candidate.name,
+                "status": "blocked_unverified_cleanup",
+                "error_class": error_class,
+                "duration_ms": duration_ms,
+                "dirty_paths": [],
+            }
+            attempt_records.append(receipt)
+            self._emit_telemetry(
+                session_key=session_key,
+                task_id=task_id,
+                workspace=workspace,
+                chosen_backend=candidate.name,
+                model=self._model_for(candidate.name, candidate.backend, call_kwargs),
+                primary_model=first_model,
+                failover_chain_records=attempt_records,
+                final_status="blocked",
+                total_duration_ms=(self._clock() - run_start) * 1000.0,
+                **telemetry_extra,
+            )
+            raise SubagentFailoverBlockedError(
+                f"{self.name!r}: failover blocked after {candidate.name!r} failed with {error_class} and cleanup was unverified",
+                attempt_receipts=attempt_records,
+            ) from exc
+        dirty_paths = self._check_dirty_worktree(workspace)
+        if dirty_paths or not idempotent:
+            receipt = {
+                "backend": candidate.name,
+                "status": "blocked_dirty_worktree",
+                "error_class": error_class,
+                "duration_ms": duration_ms,
+                "dirty_paths": dirty_paths,
+            }
+            attempt_records.append(receipt)
+            self._emit_telemetry(
+                session_key=session_key,
+                task_id=task_id,
+                workspace=workspace,
+                chosen_backend=candidate.name,
+                model=self._model_for(candidate.name, candidate.backend, call_kwargs),
+                primary_model=first_model,
+                failover_chain_records=attempt_records,
+                final_status="blocked",
+                total_duration_ms=(self._clock() - run_start) * 1000.0,
+                **telemetry_extra,
+            )
+            raise SubagentFailoverBlockedError(
+                f"{self.name!r}: failover blocked after {candidate.name!r} failed with {error_class} and left dirty paths {dirty_paths!r}",
+                attempt_receipts=attempt_records,
+            ) from exc
+
+    async def _handle_attempt_exception(
+        self,
+        *,
+        idx: int,
+        chain: list[Picked],
+        candidate: Picked,
+        exc: BaseException,
+        attempt_start: float,
+        run_start: float,
+        writes: bool,
+        idempotent: bool,
+        attempt_records: list[dict[str, Any]],
+        session_key: str | None,
+        instance: str | None,
+        task_id: str,
+        workspace: Path,
+        call_kwargs: dict[str, Any],
+        first_model: str,
+        telemetry_extra: dict[str, Any],
+    ) -> None:
+        duration_ms = round(max(0.0, (self._clock() - attempt_start) * 1000.0), 3)
+        error_class = type(exc).__name__
+        if isinstance(exc, _NON_RETRYABLE_ERRORS) or not isinstance(exc, _RETRYABLE_ERRORS):
+            attempt_records.append(
+                {"backend": candidate.name, "status": "aborted", "error_class": error_class, "duration_ms": duration_ms}
+            )
+            self._emit_telemetry(
+                session_key=session_key,
+                task_id=task_id,
+                workspace=workspace,
+                chosen_backend=candidate.name,
+                model=self._model_for(candidate.name, candidate.backend, call_kwargs),
+                primary_model=first_model,
+                failover_chain_records=attempt_records,
+                final_status="failed",
+                total_duration_ms=(self._clock() - run_start) * 1000.0,
+                **telemetry_extra,
+            )
+            raise exc
+        cleaned = await self._cleanup_failed_attempt(candidate.backend, task_id, workspace)
+        if writes:
+            self._verify_write_failover_safety(
+                candidate=candidate,
+                cleaned=cleaned,
+                idempotent=idempotent,
+                error_class=error_class,
+                duration_ms=duration_ms,
+                attempt_records=attempt_records,
+                session_key=session_key,
+                task_id=task_id,
+                workspace=workspace,
+                call_kwargs=call_kwargs,
+                first_model=first_model,
+                run_start=run_start,
+                telemetry_extra=telemetry_extra,
+                exc=exc,
+            )
+        attempt_records.append(
+            {"backend": candidate.name, "status": "failed", "error_class": error_class, "duration_ms": duration_ms}
+        )
+        self._record_cooldown(candidate.name)
+        await self._unbind_failed_instance(session_key, candidate.name, instance)
+        if len(chain) == 1:
+            raise exc
+        if idx + 1 < len(chain):
+            logger.warning(
+                "{!r}: attempt {} on {!r} failed with {}; failing over to {!r}",
+                self.name,
+                idx + 1,
+                candidate.name,
+                error_class,
+                chain[idx + 1].name,
+            )
+
     async def run(
         self,
         task: str,
@@ -841,10 +1060,6 @@ class RoutingBackend(SubagentBackend):
         authored_task: str | None = None,
         **kwargs: Any,
     ) -> str:
-        # Read out of ``kwargs`` rather than named as a parameter: every
-        # implementation behind this entry already takes ``mode`` and gets it
-        # from the same dict, and lifting it out would hand one to a backend the
-        # caller never passed one to.
         base_task = task
         base_authored_task = authored_task
         mode = kwargs.get("mode")
@@ -852,18 +1067,9 @@ class RoutingBackend(SubagentBackend):
         writes = bool(kwargs.get("writes", False))
         idempotent = bool(kwargs.get("idempotent", True))
         call_kwargs = {k: v for k, v in kwargs.items() if k not in ("writes", "idempotent")}
-        if self.specialist_definition is not None:
-            from oh_my_raven.oh_my_raven import SkillPackResolver, SpecialistDefinition
-
-            spec_def = SpecialistDefinition.from_obj(self.specialist_definition)
-            if spec_def.has_specialist_bundle:
-                base_task = SkillPackResolver.render_specialist_bundle(spec_def, base_task)
-                if spec_def.mcp_servers:
-                    existing_mcps = list(kwargs.get("mcps") or [])
-                    for srv in spec_def.mcp_servers:
-                        if srv not in existing_mcps:
-                            existing_mcps.append(srv)
-                    call_kwargs["mcps"] = existing_mcps
+        base_task, skill_packs_injected, mcp_servers_attached = self._prepare_specialist_bundle(
+            base_task, kwargs, call_kwargs
+        )
         handed = handed_files(base_task, base_authored_task, media=media_items)
         picked = await self.pick(
             base_authored_task or task,
@@ -873,11 +1079,16 @@ class RoutingBackend(SubagentBackend):
             handed=handed,
         )
         chain = self.failover_chain(picked, mode=mode, handed=handed, session_key=session_key)
-
         first_model = self._model_for(chain[0].name, chain[0].backend, call_kwargs)
         run_start = self._clock()
         attempt_records: list[dict[str, Any]] = []
         last_exc: BaseException | None = None
+        telemetry_extra = {
+            "skill_packs_injected": skill_packs_injected,
+            "mcp_servers_attached": mcp_servers_attached,
+            "context_charter_injected": "[BEGIN UNTRUSTED CONTEXT CHARTER]" in base_task,
+            "cto_brief_injected": "[BEGIN CTO STRATEGIC BRIEF]" in base_task,
+        }
 
         for idx, candidate in enumerate(chain):
             attempt_task = f"{base_task}{candidate.note}" if candidate.note else base_task
@@ -887,6 +1098,8 @@ class RoutingBackend(SubagentBackend):
                 else base_authored_task
             )
             attempt_start = self._clock()
+            self._inflight_counts[candidate.name] = int(self._inflight_counts.get(candidate.name, 0)) + 1
+            self._dispatch_counts[candidate.name] = int(self._dispatch_counts.get(candidate.name, 0)) + 1
             try:
                 result = await candidate.backend.run(
                     attempt_task,
@@ -895,19 +1108,13 @@ class RoutingBackend(SubagentBackend):
                     executor=executor,
                     session_key=session_key,
                     instance=instance,
-                    # The same hand-off the lanes make: an implementation typed against
-                    # the paper before this keyword existed is not handed it.
                     **optional_keyword(candidate.backend, "authored_task", attempt_authored),
                     **call_kwargs,
                 )
+                self._forward_candidate_attributes(candidate.name, candidate.backend)
                 duration_ms = round(max(0.0, (self._clock() - attempt_start) * 1000.0), 3)
                 attempt_records.append(
-                    {
-                        "backend": candidate.name,
-                        "status": "succeeded",
-                        "error_class": None,
-                        "duration_ms": duration_ms,
-                    }
+                    {"backend": candidate.name, "status": "succeeded", "error_class": None, "duration_ms": duration_ms}
                 )
                 self._emit_telemetry(
                     session_key=session_key,
@@ -919,110 +1126,35 @@ class RoutingBackend(SubagentBackend):
                     failover_chain_records=attempt_records,
                     final_status="succeeded",
                     total_duration_ms=(self._clock() - run_start) * 1000.0,
+                    **telemetry_extra,
                 )
                 return result
             except BaseException as exc:
-                duration_ms = round(max(0.0, (self._clock() - attempt_start) * 1000.0), 3)
-                error_class = type(exc).__name__
-                if isinstance(exc, _NON_RETRYABLE_ERRORS) or not isinstance(exc, _RETRYABLE_ERRORS):
-                    attempt_records.append(
-                        {
-                            "backend": candidate.name,
-                            "status": "aborted",
-                            "error_class": error_class,
-                            "duration_ms": duration_ms,
-                        }
-                    )
-                    self._emit_telemetry(
-                        session_key=session_key,
-                        task_id=task_id,
-                        workspace=workspace,
-                        chosen_backend=candidate.name,
-                        model=self._model_for(candidate.name, candidate.backend, call_kwargs),
-                        primary_model=first_model,
-                        failover_chain_records=attempt_records,
-                        final_status="failed",
-                        total_duration_ms=(self._clock() - run_start) * 1000.0,
-                    )
-                    raise
-
                 last_exc = exc
-                cleaned = await self._cleanup_failed_attempt(candidate.backend, task_id, workspace)
-                if writes:
-                    has_cleanup_hook = callable(getattr(candidate.backend, "cleanup_attempt", None)) or callable(
-                        getattr(candidate.backend, "cancel", None)
-                    )
-                    if has_cleanup_hook and not cleaned:
-                        receipt = {
-                            "backend": candidate.name,
-                            "status": "blocked_unverified_cleanup",
-                            "error_class": error_class,
-                            "duration_ms": duration_ms,
-                            "dirty_paths": [],
-                        }
-                        attempt_records.append(receipt)
-                        self._emit_telemetry(
-                            session_key=session_key,
-                            task_id=task_id,
-                            workspace=workspace,
-                            chosen_backend=candidate.name,
-                            model=self._model_for(candidate.name, candidate.backend, call_kwargs),
-                            primary_model=first_model,
-                            failover_chain_records=attempt_records,
-                            final_status="blocked",
-                            total_duration_ms=(self._clock() - run_start) * 1000.0,
-                        )
-                        raise SubagentFailoverBlockedError(
-                            f"{self.name!r}: failover blocked after {candidate.name!r} failed with {error_class} and cleanup was unverified",
-                            attempt_receipts=attempt_records,
-                        ) from exc
-                    dirty_paths = self._check_dirty_worktree(workspace)
-                    if dirty_paths or not idempotent:
-                        receipt = {
-                            "backend": candidate.name,
-                            "status": "blocked_dirty_worktree",
-                            "error_class": error_class,
-                            "duration_ms": duration_ms,
-                            "dirty_paths": dirty_paths,
-                        }
-                        attempt_records.append(receipt)
-                        self._emit_telemetry(
-                            session_key=session_key,
-                            task_id=task_id,
-                            workspace=workspace,
-                            chosen_backend=candidate.name,
-                            model=self._model_for(candidate.name, candidate.backend, call_kwargs),
-                            primary_model=first_model,
-                            failover_chain_records=attempt_records,
-                            final_status="blocked",
-                            total_duration_ms=(self._clock() - run_start) * 1000.0,
-                        )
-                        raise SubagentFailoverBlockedError(
-                            f"{self.name!r}: failover blocked after {candidate.name!r} failed with {error_class} and left dirty paths {dirty_paths!r}",
-                            attempt_receipts=attempt_records,
-                        ) from exc
-
-                attempt_records.append(
-                    {
-                        "backend": candidate.name,
-                        "status": "failed",
-                        "error_class": error_class,
-                        "duration_ms": duration_ms,
-                    }
+                await self._handle_attempt_exception(
+                    idx=idx,
+                    chain=chain,
+                    candidate=candidate,
+                    exc=exc,
+                    attempt_start=attempt_start,
+                    run_start=run_start,
+                    writes=writes,
+                    idempotent=idempotent,
+                    attempt_records=attempt_records,
+                    session_key=session_key,
+                    instance=instance,
+                    task_id=task_id,
+                    workspace=workspace,
+                    call_kwargs=call_kwargs,
+                    first_model=first_model,
+                    telemetry_extra=telemetry_extra,
                 )
-                self._record_cooldown(candidate.name)
-                await self._unbind_failed_instance(session_key, candidate.name, instance)
-                if len(chain) == 1:
-                    raise
-                if idx + 1 < len(chain):
-                    logger.warning(
-                        "{!r}: attempt {} on {!r} failed with {}; failing over to {!r}",
-                        self.name,
-                        idx + 1,
-                        candidate.name,
-                        error_class,
-                        chain[idx + 1].name,
-                    )
+            finally:
+                cur_inf = int(self._inflight_counts.get(candidate.name, 0))
+                if cur_inf <= 1:
+                    self._inflight_counts.pop(candidate.name, None)
+                else:
+                    self._inflight_counts[candidate.name] = cur_inf - 1
 
         last_candidate = chain[-1]
         self._emit_telemetry(
@@ -1035,6 +1167,7 @@ class RoutingBackend(SubagentBackend):
             failover_chain_records=attempt_records,
             final_status="exhausted",
             total_duration_ms=(self._clock() - run_start) * 1000.0,
+            **telemetry_extra,
         )
         summary = ", ".join(f"{r['backend']}:{r['error_class']}" for r in attempt_records)
         raise SubagentFailoverExhaustedError(

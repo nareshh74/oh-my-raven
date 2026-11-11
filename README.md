@@ -166,33 +166,39 @@ RequirementTraceabilityGate.verify_acceptance_receipt(
 
 ## Repository layout
 
-- `oh_my_raven/oh_my_raven.py`: Core specialist definitions, `SkillPackResolver`, `CtoStrategicBrief`, `CtoAlignmentGate`, `WorktreeManager`, `DurableRecoveryLedger`, `ReviewGateValidator`, `RequirementTraceabilityGate`, and `DagSpecialistRuntime`.
-- `oh_my_raven/routing.py`: `RoutingBackend`, `RouteTarget`, ordered failover, dirty-worktree failover guard, timed cooldowns, workload-learning score (`_workload_score()`), and process-safe `TelemetryLogger`.
+- `oh_my_raven/oh_my_raven.py`: Core specialist definitions, `OmrTaskQueue`, `OmrDispatcher`, `DynamicDecompositionGate`, `SkillAndToolReceiptGate`, `SkillPackResolver`, `CtoStrategicBrief`, `CtoAlignmentGate`, `WorktreeManager`, `DurableRecoveryLedger`, `ReviewGateValidator`, `RequirementTraceabilityGate`, and `DagSpecialistRuntime`.
+- `oh_my_raven/routing.py`: `RoutingBackend`, `RouteTarget`, ordered failover, dirty-worktree failover guard, timed cooldowns, balanced multi-harness load distribution & workload-learning score (`_workload_score()`, `_target_rank_key()`), and process-safe `TelemetryLogger`.
 - `oh_my_raven/specialist_support.py`: Re-export module for `raven.agent.subagent.specialist_support` compatibility.
 - `playbooks/oh-my-raven/playbook.md`: Declarative v2 DAG playbook (`cto_strategy -> slice_a, slice_b -> integrate -> review -> remediate -> re_review`).
 - `docs/oh_my_raven_spec.md`: Architecture specification.
-- `docs/specialist_mvp_experiment_report.json`: Recorded outputs from the six live verification experiments.
-- `scripts/run_specialist_mvp_experiment.py`: Script that runs the live failover, worktree isolation, review gate, playbook validation, 20-item requirement traceability, and dynamic pool discovery experiments.
+- `docs/specialist_mvp_experiment_report.json`: Recorded outputs from the six live verification experiments (`R1` through `R23`).
+- `scripts/run_specialist_mvp_experiment.py`: Script that runs the live failover, worktree isolation, review gate, playbook validation, 23-item requirement traceability (`R1-R23`), and dynamic pool discovery experiments.
+- `tests/test_omr_repeatable_e2e_matrix.py`: Repeatable end-to-end verification matrix covering all 11 owner criteria, 6 adversarial anti-gaming traps, and the $7 \times 5$ (35-permutation) Specialist-on-Any-Harness matrix + hot-onboarding (`Cursor-ACP`) + mid-flight crash failover.
 - `tests/test_specialist_orchestration_e2e.py`: End-to-end tests for worktree isolation, scope enforcement, CTO strategic brief propagation, review identity checks, recovery ledger quarantine, and AST requirement traceability.
 - `tests/test_subagent_routing_backend.py`: Unit and integration tests for `RoutingBackend`, failover chains, dirty-worktree blocks, telemetry tail recovery, and dynamic pool discovery.
 
 ## Verification receipts
 
-### End-to-end test suite (`88 passed`)
+### Repeatable 11-Point E2E, 6 Adversarial Traps & $7 \times 5$ Portability Matrix (`95 passed`)
 
-Run the full test suite against a Raven checkout:
+Run the complete repeatable verification suite (`--omr-mode=deterministic|live`):
 
 ```bash
-PYTHONPATH=".:/path/to/Raven:/path/to/Raven/packages/raven-everos" \
-  python -X utf8 -m pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts="" -q
+python -X utf8 -m pytest tests/test_omr_repeatable_e2e_matrix.py tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts="" -v
 ```
 
 Measured output:
 
 ```text
-........................................................................ [ 81%]
-................                                                         [100%]
-88 passed in 79.02s (0:01:19)
+tests/test_omr_repeatable_e2e_matrix.py::test_01_idempotent_multi_run_repeatability PASSED
+tests/test_omr_repeatable_e2e_matrix.py::test_02_to_06_full_intake_queue_routing_and_dynamic_decomposition_pipeline PASSED
+tests/test_omr_repeatable_e2e_matrix.py::test_07_specialist_skill_packs_mcps_and_tool_receipt_gate PASSED
+tests/test_omr_repeatable_e2e_matrix.py::test_08_cto_and_reviewer_remediation_and_rtm_ast_gate PASSED
+tests/test_omr_repeatable_e2e_matrix.py::test_09_harness_pool_distribution_and_workload_learning PASSED
+tests/test_omr_repeatable_e2e_matrix.py::test_10_tunnel_view_semantic_trap_and_secret_redaction PASSED
+tests/test_omr_repeatable_e2e_matrix.py::test_11_seven_by_five_specialist_harness_matrix_hot_onboarding_and_crash_failover PASSED
+...
+95 passed in 163.84s (0:02:43)
 ```
 
 ### Live experiment receipts (`docs/specialist_mvp_experiment_report.json`)
@@ -200,13 +206,13 @@ Measured output:
 Regenerate the experiment report with `python scripts/run_specialist_mvp_experiment.py`:
 
 - **Experiment 1 (Ordered failover and dirty-worktree block):** Primary CLI exits with code 1; `RoutingBackend` fails over to `SecondaryCli` (`SECONDARY_SPECIALIST_OK`) and logs the attempt chain to `telemetry.jsonl`. When a non-idempotent write leaves `partial.txt` in the worktree after a timeout, `RoutingBackend` raises `SubagentFailoverBlockedError` instead of running the second agent over corrupt state.
-- **Experiment 2 (Isolated Git worktrees and slice integration):** Provisions `exp-slice_a` and `exp-slice_b` worktrees from base commit `ccfc24ab`, verifies zero untracked file leakage from the dirty main checkout, commits scoped changes in each worktree, and cherry-picks both slices into `exp-integration` (`integrated_head = 5343f712f237cd20e75b5169b3df4a0c3af738f5`).
+- **Experiment 2 (Isolated Git worktrees and slice integration):** Provisions `exp-slice_a` and `exp-slice_b` worktrees from base commit `ccfc24ab`, verifies zero untracked file leakage from the dirty main checkout, commits scoped changes in each worktree, and cherry-picks both slices into `exp-integration`.
 - **Experiment 3 (Review identity, recovery ledger, and secret redaction):** Rejects a reviewer sharing `(cli, claude.exe, p1)` with the author (`IndependentReviewError`), rejects an approval missing required `ocr` command evidence, persists `DurableRecoveryLedger` across instances, blocks the second `changes_requested` cycle (`ReviewCycleLimitError`), and redacts `ghp_*` tokens from `build_holistic_charter()`.
 - **Experiment 4 (Playbook graph validation):** Builds and validates the 7-node `oh-my-raven` v2 DAG playbook (`validate_graph_nodes() == []`).
-- **Experiment 5 (20-item Requirement Traceability Gate):** Verifies all 20 requirement items (`R1` through `R20`) against live files and AST symbols, and confirms that deferred items, test-only callers, nested `/tests/` paths, and missing expected IDs raise `PrematureCompletionError`.
-- **Experiment 6 (Decoupled specialist pool onboarding):** Confirms `Engineer - Superpowers` has `command = None` and `routes = []`, auto-discovers `["HarnessOne", "HarnessTwo"]` on initial load, auto-discovers `["HarnessOne", "HarnessTwo", "HarnessThree"]` as soon as `HarnessThree` is added to the table, and injects `superpowers`, `ecc`, and `mattpocock` skill packs into the rendered bundle.
+- **Experiment 5 (23-item Requirement Traceability Gate — `R1` through `R23`):** Verifies all 23 requirement items (`R1` through `R23`, including `R21: OmrDispatcher.submit_task`, `R22: DynamicDecompositionGate.validate_and_enqueue`, and `R23: SkillAndToolReceiptGate.verify_specialist_execution`) against live files and AST symbols (`23/23 met, 0 unmet, 0 deferred`), and confirms that deferred items, test-only callers, nested `/tests/` paths, and missing expected IDs raise `PrematureCompletionError`.
+- **Experiment 6 (Decoupled specialist pool onboarding):** Confirms `Engineer - Superpowers` has `command = ""` and `routes = []`, auto-discovers enabled runtime harnesses on initial load, auto-discovers `HarnessThree` as soon as it is added to the table, and injects `superpowers`, `ecc`, and `mattpocock` skill packs into the rendered bundle.
 
-### Desloppify mechanical scan receipt
+### Desloppify mechanical scan receipt (`0` T1 / `0` T2 issues)
 
 Command:
 
@@ -214,22 +220,18 @@ Command:
 desloppify scan --path . --no-badge
 ```
 
-Measured output after resolving `unused`, `dict_keys`, `empty_except`, `silent_except`, `swallowed_error`, `subprocess_no_timeout`, `B110`, `B112`, and `B607` findings across `oh_my_raven/oh_my_raven.py`, `oh_my_raven/routing.py`, `scripts/run_specialist_mvp_experiment.py`, and `tests/`:
+Measured output:
 
 ```text
 Desloppify Scan (python)
-  Scores: overall 21.6/100  objective 86.4/100 (+33.0 from 53.4 baseline)  verified 86.4/100
-  Zones: production: 4, script: 1, test: 2
+  Scores: overall 22.0/100  objective 88.0/100  verified 88.0/100
+  Zones: production: 4, script: 1, test: 4
   [1/17] Unused (ruff)...          0 instances -> 0 issues
   [11/17] Private imports...       clean (5 files scanned)
   [13/17] Dict key flow...         0 dict key issues
-  [17/17] Duplicates...            0 clusters (100.0% duplication health)
-  Dimension health:
-    Duplication   100.0%
-    Code quality   84.9%
-    Security       77.5%
-    Test health    77.5%
-    File health    60.0%
+  [17/17] Duplicates...            0 clusters (99.4% duplication health)
+  Open T1 issues: 0
+  Open T2 issues: 0
 ```
 
 ## License

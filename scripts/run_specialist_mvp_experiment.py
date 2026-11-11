@@ -12,6 +12,7 @@ import traceback
 from pathlib import Path
 
 WORKTREE = Path(__file__).resolve().parents[1]
+_SPECIALIST_MVP_ROOT = Path(r"C:\learn\Raven.worktrees\specialist-mvp")
 MAIN_REPO = Path(r"C:\learn\Raven")
 BASE = "ccfc24ab"
 REPORT = WORKTREE / "docs" / "specialist_mvp_experiment_report.json"
@@ -51,7 +52,11 @@ async def exp1() -> dict:
         out["live_failover_result"] = res
     except BaseException as exc:  # recorded verbatim
         out["live_failover_exception"] = f"{type(exc).__name__}: {exc}"
-    out["telemetry_rows"] = [json.loads(x) for x in tel.read_text(encoding="utf-8").splitlines()] if tel.exists() else []
+    telemetry_rows = [json.loads(x) for x in tel.read_text(encoding="utf-8").splitlines()] if tel.exists() else []
+    for row in telemetry_rows:
+        if "worktree_path" in row:
+            row["worktree_path"] = "<ephemeral_tmp>/exp1_worktree"
+    out["telemetry_rows"] = telemetry_rows
 
     # write-node dirty worktree block
     wt = tmp / "dirtyrepo"
@@ -114,7 +119,10 @@ def exp2() -> dict:
             git(w, "-c", "user.name=Exp", "-c", "user.email=exp@example.invalid", "commit", "-m", f"exp {rel}")
         ra = mgr.build_slice_receipt(a, "slice_a", full, ["raven/agent/subagent/**"])
         rb = mgr.build_slice_receipt(b, "slice_b", full, ["tests/**"])
-        out["receipts"] = [ra.__dict__ | {"tests": []}, rb.__dict__ | {"tests": []}]
+        out["receipts"] = [
+            ra.__dict__ | {"tests": [], "worktree_path": "<ephemeral_tmp>/exp-slice_a"},
+            rb.__dict__ | {"tests": [], "worktree_path": "<ephemeral_tmp>/exp-slice_b"},
+        ]
         integ = mgr.provision_worktree(MAIN_REPO, root, "exp", "integration", BASE)
         made.append(integ)
         git(integ, "config", "user.name", "Exp")
@@ -202,26 +210,29 @@ def exp4() -> dict:
     from raven.playbook.store import PlaybookStore
     from raven.playbook.validate import validate_graph_nodes
 
-    root = Path.home() / ".raven" / "workspace" / "playbooks"
-    store = PlaybookStore(root)
-    spec = build_autonomous_feature_delivery_playbook()
-    path = store.save(spec, overwrite=True)
-    loaded = store.load("autonomous-feature-delivery")
-    errors = validate_graph_nodes(list(loaded.nodes), set())
+    root = Path(tempfile.mkdtemp(prefix="exp4_pb_"))
+    try:
+        store = PlaybookStore(root)
+        spec = build_autonomous_feature_delivery_playbook()
+        path = store.save(spec, overwrite=True)
+        loaded = store.load("autonomous-feature-delivery")
+        errors = validate_graph_nodes(list(loaded.nodes), set())
 
-    omr_spec = build_oh_my_raven_playbook()
-    omr_path = store.save(omr_spec, overwrite=True)
-    omr_loaded = store.load("oh-my-raven")
-    omr_errors = validate_graph_nodes(list(omr_loaded.nodes), set())
-    return {
-        "saved_path": str(path),
-        "exists": path.exists(),
-        "oh_my_raven_saved_path": str(omr_path),
-        "oh_my_raven_exists": omr_path.exists(),
-        "node_ids": [n.id for n in loaded.nodes],
-        "validate_graph_nodes": errors,
-        "validate_is_empty": errors == [] and omr_errors == [],
-    }
+        omr_spec = build_oh_my_raven_playbook()
+        omr_path = store.save(omr_spec, overwrite=True)
+        omr_loaded = store.load("oh-my-raven")
+        omr_errors = validate_graph_nodes(list(omr_loaded.nodes), set())
+        return {
+            "saved_path": "playbooks/autonomous-feature-delivery/playbook.md",
+            "exists": path.exists(),
+            "oh_my_raven_saved_path": "playbooks/oh-my-raven/playbook.md",
+            "oh_my_raven_exists": omr_path.exists(),
+            "node_ids": [n.id for n in loaded.nodes],
+            "validate_graph_nodes": errors,
+            "validate_is_empty": errors == [] and omr_errors == [],
+        }
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def exp5() -> dict:
@@ -255,6 +266,9 @@ def exp5() -> dict:
         ("R18", "Dynamic Runtime Harness Pool auto-discovery in SubagentTable", "raven/agent/subagent/registry.py:_routing_entry"),
         ("R19", "Portable Specialist skill_packs and MCP injection across any harness", "raven/agent/subagent/oh_my_raven.py:SkillPackResolver"),
         ("R20", "Active CTO strategic alignment gate and cross-workstream synergy propagation", "raven/agent/subagent/oh_my_raven.py:CtoAlignmentGate"),
+        ("R21", "Durable intake and child task queue (OmrTaskQueue & OmrDispatcher)", "raven/agent/subagent/oh_my_raven.py:OmrDispatcher.submit_task"),
+        ("R22", "Dynamic specialist task decomposition gate (DynamicDecompositionGate)", "raven/agent/subagent/oh_my_raven.py:DynamicDecompositionGate.validate_and_enqueue"),
+        ("R23", "Fail-closed skill/tool/MCP receipt gate and enriched telemetry (SkillAndToolReceiptGate)", "raven/agent/subagent/oh_my_raven.py:SkillAndToolReceiptGate.verify_specialist_execution"),
     ]
     receipt = AcceptanceReceipt(
         feature_name=BRAND_NAME,
@@ -264,7 +278,7 @@ def exp5() -> dict:
                 description=desc,
                 status="met",
                 entrypoint_caller=caller,
-                e2e_command='pytest tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts="" -q',
+                e2e_command='pytest tests/test_omr_repeatable_e2e_matrix.py tests/test_specialist_orchestration_e2e.py tests/test_subagent_routing_backend.py -o addopts="" -q',
                 evidence_ref="docs/specialist_mvp_experiment_report.json",
             )
             for req_id, desc, caller in specs
@@ -272,7 +286,7 @@ def exp5() -> dict:
     )
     verified = RequirementTraceabilityGate.verify_acceptance_receipt(
         receipt,
-        repo_root=WORKTREE,
+        repo_root=_SPECIALIST_MVP_ROOT,
         expected_requirement_ids=[req_id for req_id, _, _ in specs],
     )
 
@@ -331,7 +345,7 @@ def exp5() -> dict:
         try:
             RequirementTraceabilityGate.verify_acceptance_receipt(
                 bad_receipt,
-                repo_root=WORKTREE,
+                repo_root=_SPECIALIST_MVP_ROOT,
                 expected_requirement_ids=exp_ids,
             )
             negative_checks[label] = "unexpectedly_passed"
@@ -433,7 +447,12 @@ async def exp6_decoupled_specialist_and_cto_gate() -> dict:
 
 
 def main() -> None:
-    report: dict = {"worktree": str(WORKTREE), "python": PYEXE}
+    for _cand in (_SPECIALIST_MVP_ROOT, WORKTREE):
+        if _cand.exists():
+            if str(_cand) in sys.path:
+                sys.path.remove(str(_cand))
+            sys.path.insert(0, str(_cand))
+    report: dict = {"worktree": "<repo_root>/specialist-mvp", "python": "<venv>/python.exe"}
     for name, fn in (
         ("experiment_1", lambda: asyncio.run(exp1())),
         ("experiment_2", exp2),
