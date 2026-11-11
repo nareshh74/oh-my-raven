@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oh-my-raven"
+version = "0.1.0"
+description = "Harness-agnostic specialist orchestration, dynamic harness pool failover, isolated git worktree DAGs, CTO strategic alignment, and fail-closed requirement traceability gates for Raven"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Naresh Kumar" },
+]
+keywords = ["raven", "multi-agent", "orchestration", "git-worktree", "dag", "code-review"]
+dependencies = [
+    "loguru>=0.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["oh_my_raven"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "slow: tests that run real git or subprocess workflows",
+]
+
