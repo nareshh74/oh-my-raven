@@ -1370,6 +1370,7 @@ class DagSpecialistRuntime:
         workdir: str | Path = "",
         run_dir: str | Path | None = None,
         max_review_cycles: int = 3,
+        require_skill_evidence: bool = False,
         charter_context: dict[str, Any] | None = None,
     ) -> None:
         self.enabled = False
@@ -1377,6 +1378,7 @@ class DagSpecialistRuntime:
         self.run_dir: Path | None = Path(run_dir) if run_dir is not None else None
         self.run_id = ""
         self.max_review_cycles = max_review_cycles
+        self.require_skill_evidence = bool(require_skill_evidence)
         self.charter_context: dict[str, Any] | None = dict(charter_context) if charter_context else None
         self.base_sha: str | None = None
         self.ledger: DurableRecoveryLedger | None = None
@@ -1443,10 +1445,14 @@ class DagSpecialistRuntime:
                 if isinstance(ctx, dict) and ctx:
                     charter_context = ctx
                     break
+        require_skill_ev = any(
+            bool(getattr(b, "require_skill_evidence", False)) for b in (node_backends or {}).values()
+        )
         rt = cls(
             workdir=workdir,
             run_dir=Path(store.run_dir),
             max_review_cycles=max_review_cycles if max_review_cycles is not None else 3,
+            require_skill_evidence=require_skill_ev,
             charter_context=charter_context,
         )
         rt.node_backends = dict(node_backends or {})
@@ -1498,6 +1504,7 @@ class DagSpecialistRuntime:
             any(n.execution_kind in _SPECIAL_KINDS for n in spec.nodes)
             or bool(self.charter_context)
             or self.expected_requirement_ids is not None
+            or self.require_skill_evidence
             or any(
                 bool(getattr(self.node_backends.get(n.id), "require_skill_evidence", False))
                 or bool(getattr(self.node_backends.get(n.id), "specialist_definition", None))
@@ -1749,7 +1756,11 @@ class DagSpecialistRuntime:
             node,
             agent_backend,
             result,
-            require_skill_evidence=bool(getattr(self, "require_skill_evidence", False)),
+            require_skill_evidence=(
+                bool(getattr(self, "require_skill_evidence", False))
+                or bool(getattr(agent_backend, "require_skill_evidence", False))
+                or bool(getattr(node, "require_skill_evidence", False))
+            ),
         )
         ev_dict = evidence_info if isinstance(evidence_info, dict) else {}
         if node.execution_kind == "write" and node.id in self.node_worktrees:
@@ -2216,13 +2227,10 @@ class DynamicDecompositionGate:
                 )
 
         manifest_path: Path | None = None
-        if expected_ids:
-            for target_dir in (run_dir, workdir):
-                if target_dir is not None:
-                    mpath = Path(target_dir) / "requirements_manifest.json"
-                    _write_json(mpath, {"expected_requirement_ids": expected_ids})
-                    if manifest_path is None:
-                        manifest_path = mpath
+        if expected_ids and run_dir is not None:
+            mpath = Path(run_dir) / "requirements_manifest.json"
+            _write_json(mpath, {"expected_requirement_ids": expected_ids})
+            manifest_path = mpath
 
         waves = cls.compute_topological_waves(dag_spec.nodes)
         ordered_nodes = sorted(dag_spec.nodes, key=lambda n: (waves.get(n.id, 0), n.id))
@@ -2424,6 +2432,81 @@ class OmrDispatcher:
             progress_publisher=_progress_pub,
             judge_node=judge_node or self._default_dag_judge,
         )
+
+    async def dispatch_specialist_node(
+        self,
+        task_id: str,
+        specialist_name: str,
+        prompt: str,
+        *,
+        parent_task_id: str | None = None,
+        workspace: Path | str | None = None,
+        session_key: str | None = "omr-session",
+        writes: bool = False,
+        idempotent: bool = True,
+        require_skill_evidence: bool = False,
+        **kwargs: Any,
+    ) -> str:
+        ws = Path(workspace) if workspace is not None else self.workdir
+        self.queue.enqueue(
+            task_id,
+            prompt,
+            parent_task_id=parent_task_id,
+            assigned_specialist=specialist_name,
+            wave=0,
+            status="enqueued",
+        )
+        backend = self.table.backend(specialist_name)
+        if backend is None:
+            self.queue.transition(task_id, "failed", assigned_specialist=specialist_name, error="unknown specialist")
+            raise DagValidationError(f"Specialist {specialist_name!r} not found in SubagentTable")
+        self.queue.transition(task_id, "routed", assigned_specialist=specialist_name)
+        self.queue.transition(task_id, "running", assigned_specialist=specialist_name)
+        framed_prompt = self._build_framed_prompt(prompt)
+        try:
+            result = await backend.run(
+                framed_prompt,
+                task_id=task_id,
+                workspace=ws,
+                executor=None,
+                session_key=session_key,
+                authored_task=prompt,
+                writes=writes,
+                idempotent=idempotent,
+                **kwargs,
+            )
+            chosen_harness = str(getattr(backend, "last_chosen_backend", "") or getattr(backend, "name", "") or "")
+            node_stub = DagNodeSpec(
+                id=re.sub(r"[^A-Za-z0-9_-]", "_", task_id)[:60] or "node",
+                subagent=specialist_name,
+                node_summary=task_id[:40] or "task",
+                prompt_template=prompt,
+                execution_kind="write" if writes else "read",
+                file_scope=["**"] if writes else [],
+            )
+            SkillAndToolReceiptGate.verify_specialist_execution(
+                node_stub,
+                backend,
+                result,
+                require_skill_evidence=require_skill_evidence or bool(getattr(backend, "require_skill_evidence", False)),
+            )
+            self.queue.transition(
+                task_id,
+                "completed",
+                assigned_specialist=specialist_name,
+                assigned_harness=chosen_harness,
+            )
+            return result
+        except BaseException as exc:
+            chosen_harness = str(getattr(backend, "last_chosen_backend", "") or getattr(backend, "name", "") or "")
+            self.queue.transition(
+                task_id,
+                "failed",
+                assigned_specialist=specialist_name,
+                assigned_harness=chosen_harness,
+                error=str(exc),
+            )
+            raise
 
     async def submit_task(
         self,
