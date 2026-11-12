@@ -38,3 +38,32 @@ def test_policy_auto_logs_decisions_and_asks_for_intent_and_irreversible(tmp_pat
     assert not d.decide_gate("ambiguous_product_intent")
     assert not d.decide_gate("push")
     assert [x["gate"] for x in json.loads(d.gate_log_path.read_text())] == ["plan_gap", "technical_decision"]
+
+
+def _run_node(tmp_path, output):
+    import asyncio
+    from types import SimpleNamespace
+
+    class B:
+        name = "b"
+        last_chosen_backend = "b"
+
+        async def run(self, *a, **k):
+            return output
+
+    d = dispatcher(tmp_path)
+    d.table = SimpleNamespace(backend=lambda n: B())
+    from oh_my_raven import oh_my_raven as m
+
+
+    asyncio.run(d.dispatch_specialist_node("t1", "S", "p"))
+    return d.queue.latest_by_task()["t1"].status
+
+
+def test_single_task_without_evidence_is_incomplete(tmp_path, monkeypatch):
+    from oh_my_raven import oh_my_raven as m
+
+    monkeypatch.setattr(m.SkillAndToolReceiptGate, "verify_specialist_execution", staticmethod(lambda *a, **k: None))
+    assert _run_node(tmp_path, "done") == "incomplete"
+    good = json.dumps({"evidence": {"command": "pytest", "exit_code": 0}})
+    assert _run_node(tmp_path / "g", good) == "completed"

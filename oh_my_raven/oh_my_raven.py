@@ -2507,7 +2507,7 @@ class OmrDispatcher:
             )
             self.queue.transition(
                 task_id,
-                "completed",
+                self.completion_status(str(result)),
                 assigned_specialist=specialist_name,
                 assigned_harness=chosen_harness,
             )
@@ -2617,9 +2617,13 @@ class OmrDispatcher:
             if cleanup_worktrees:
                 self._cleanup_run_worktrees(effective_run_id)
 
+            latest = self.queue.latest_by_task()
+            children_done = all(
+                e.status == "completed" for e in latest.values() if e.parent_task_id == task_id
+            )
             self.queue.transition(
                 task_id,
-                "failed" if any_failed else "completed",
+                "failed" if any_failed else "completed" if children_done else "incomplete",
                 assigned_specialist=chosen_lead,
                 assigned_harness=chosen_mgr_harness,
             )
