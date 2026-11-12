@@ -21,6 +21,7 @@ from loguru import logger
 from raven.agent.subagent.dag_graph import DagNodeSpec
 from raven.agent.subagent.prompt_errors import DagValidationError
 from raven.contracts.subagent_backend import SubagentBackend, SubagentNoAnswerError
+from .gate import GatePolicy, has_verifiable_evidence
 
 BRAND_NAME = "oh-my-raven"
 
@@ -1918,7 +1919,7 @@ class DagSpecialistRuntime:
             )
 
 
-QueueStatus = Literal["enqueued", "routed", "decomposing", "running", "completed", "failed"]
+QueueStatus = Literal["enqueued", "routed", "decomposing", "running", "completed", "incomplete", "failed"]
 
 
 @dataclass(frozen=True)
@@ -2280,6 +2281,7 @@ class OmrDispatcher:
         history_root: Path | str,
         intake_router: Callable[[list[tuple[str, str]], str, str], Any] | None = None,
         charter_context: dict[str, Any] | None = None,
+        gate_policy_path: Path | str | None = None,
     ) -> None:
         self.table = table
         self.queue = queue
@@ -2289,6 +2291,19 @@ class OmrDispatcher:
         self.history_root = Path(history_root)
         self.intake_router = intake_router
         self.charter_context = dict(charter_context) if charter_context else None
+        self.gate_policy = GatePolicy.load_default(gate_policy_path)
+        self.gate_log_path = self.run_root / "gate_log.json"
+
+    def completion_status(self, result: str) -> QueueStatus:
+        """Return completed only when result contains evidence we can verify."""
+        return "completed" if has_verifiable_evidence(result, self.workdir) else "incomplete"
+
+    def decide_gate(self, gate: str, detail: str = "") -> bool:
+        proceed = self.gate_policy.decide(gate, detail)
+        if self.gate_policy.log:
+            self.gate_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.gate_policy.persist_log(self.gate_log_path)
+        return proceed
 
     async def route_intake_specialist(self, prompt: str, *, default: str = "Manager") -> str:
         menu = [(row.name, row.description) for row in self.table.enabled() if not row.is_harness or row.kind == "specialist"]
@@ -2411,7 +2426,7 @@ class OmrDispatcher:
                     h_name = str(getattr(b_obj, "last_chosen_backend", "") or "")
                     self.queue.transition(
                         nid,
-                        "completed" if st == "completed" else "failed",
+                        self.completion_status(str(payload.get("output") or "")) if st == "completed" else "failed",
                         assigned_specialist=node_obj.subagent,
                         assigned_harness=h_name,
                         wave=node_waves.get(nid, 0),
