@@ -24,7 +24,6 @@ from raven.agent.subagent.oh_my_raven import (
     CommandReceipt,
     CtoStrategicBrief,
     DagSpecialistRuntime,
-    DecompositionPlan,
     DynamicDecompositionGate,
     ExecutionIdentity,
     IndependentReviewError,
@@ -35,7 +34,6 @@ from raven.agent.subagent.oh_my_raven import (
     RequirementTraceabilityGate,
     ReviewGateValidator,
     ReviewReceipt,
-    SkillAndToolReceiptGate,
     SkillContractViolationError,
     SliceReceipt,
     WorktreeManager,
@@ -540,30 +538,44 @@ class DeterministicHarnessBackend:
             model=model,
         )
 
-    def _record_skill_receipts(self, task_prompt: str, node_id: str, mcps: list[str]) -> None:
+    def _record_skill_receipts(self, task_prompt: str, node_id: str, mcps: list[str], workspace: Path) -> None:
         if node_id in self.omit_skill_evidence_for:
             self.last_skill_evidence = {}
             self.last_invoked_tools = ()
             self.last_invoked_mcps = ()
             return
+        matched_packs = [
+            pack
+            for pack in (
+                "office-hours",
+                "plan-ceo-review",
+                "plan-eng-review",
+                "autoplan",
+                "agent-skills",
+                "pstack",
+                "mattpocock",
+                "superpowers",
+                "ecc",
+                "open-code-review",
+            )
+            if f"### Skill Pack: {pack}" in task_prompt
+        ]
         evidence: dict[str, CommandReceipt] = {}
-        for pack in (
-            "office-hours",
-            "plan-ceo-review",
-            "plan-eng-review",
-            "autoplan",
-            "agent-skills",
-            "pstack",
-            "mattpocock",
-            "superpowers",
-            "ecc",
-            "open-code-review",
-        ):
-            if f"### Skill Pack: {pack}" in task_prompt:
+        if matched_packs:
+            cmd_str = "git status --porcelain"
+            proc = subprocess.run(
+                ["git", "-C", str(workspace), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            out_summary = proc.stdout.strip() or f"{self.name}:{node_id}:clean"
+            for pack in matched_packs:
                 evidence[pack] = CommandReceipt(
-                    command=f"verify-skill-pack --pack {pack} --node {node_id}",
-                    exit_code=0,
-                    output_ref=f"{node_id}:{pack}:ok",
+                    command=f"{cmd_str} # skill_pack={pack} node={node_id}",
+                    exit_code=int(proc.returncode),
+                    output_ref=out_summary[:120],
                 )
         self.last_skill_evidence = evidence
         self.last_invoked_tools = ("read_file", "write_file", "exec")
@@ -602,7 +614,7 @@ class DeterministicHarnessBackend:
             profile_or_namespace=f"{self.name.lower()}-ns",
             model=self.model,
         )
-        self._record_skill_receipts(task, task_id, mcps)
+        self._record_skill_receipts(task, task_id, mcps, ws)
 
         # 1. Intake CTO or DAG cto_strategy
         if task_id.endswith("::cto_intake") or task_id == "cto_strategy":
@@ -931,8 +943,6 @@ def test_01_idempotent_multi_run_repeatability(tmp_path: Path, monkeypatch: pyte
     def _execute_isolated_run(run_label: str) -> dict[str, Any]:
         run_base = tmp_path / run_label
         rig = OmrRepeatableTestRig(run_base)
-        # Ensure Reviewer Pass 1 doesn't require acceptance_receipt before Pass 2 approval
-        (rig.repo / "requirements_manifest.json").unlink(missing_ok=True)
         queue = OmrTaskQueue(rig.queue_path)
         dispatcher = OmrDispatcher(
             table=rig.table,
@@ -944,48 +954,26 @@ def test_01_idempotent_multi_run_repeatability(tmp_path: Path, monkeypatch: pyte
             charter_context=rig.charter_context,
         )
 
-        # Override DynamicDecompositionGate manifest write during Pass 1 so Pass 1 can return changes_requested
-        # and Pass 2 (`re_review`) verifies the full manifest + AcceptanceReceipt!
-        orig_validate = DynamicDecompositionGate.validate_and_enqueue
-
-        def _validate_with_manifest_on_rereview(
-            plan_payload: Any,
-            q: OmrTaskQueue,
-            parent_task_id: str,
-            run_dir: Path | str | None = None,
-            **kw: Any,
-        ) -> DecompositionPlan:
-            plan = orig_validate(plan_payload, q, parent_task_id, run_dir=run_dir, **kw)
-            # Attach expected_requirement_ids on Reviewer for Pass 2 verification while allowing Pass 1 changes_requested
-            for p in (Path(run_dir) / "requirements_manifest.json" if run_dir else None, rig.repo / "requirements_manifest.json"):
-                if p is not None and p.exists():
-                    p.unlink()
-            return plan
-
-        monkeypatch.setattr(DynamicDecompositionGate, "validate_and_enqueue", _validate_with_manifest_on_rereview)
-        try:
-            res = asyncio.run(
-                dispatcher.submit_task(
-                    "OMR-COMPLEX-001",
-                    OMR_COMPLEX_001_PROMPT,
-                    run_id="omr-complex-001",
-                    cleanup_worktrees=True,
-                )
+        res = asyncio.run(
+            dispatcher.submit_task(
+                "OMR-COMPLEX-001",
+                OMR_COMPLEX_001_PROMPT,
+                run_id="omr-complex-001",
+                cleanup_worktrees=True,
             )
-        finally:
-            monkeypatch.setattr(DynamicDecompositionGate, "validate_and_enqueue", orig_validate)
-
-        # Persist and verify the 4-item requirements_manifest.json against the final integrated repo AST
-        manifest_file = rig.repo / "requirements_manifest.json"
-        manifest_file.write_text(
-            json.dumps({"expected_requirement_ids": EXPECTED_REQUIREMENT_IDS}),
-            encoding="utf-8",
         )
+
+        # Verify requirements_manifest.json was written by DynamicDecompositionGate into run_dir BEFORE run_dag and remained intact
+        assert res.decomposition_plan.manifest_path is not None
+        assert res.decomposition_plan.manifest_path.exists()
+        manifest_data = json.loads(res.decomposition_plan.manifest_path.read_text(encoding="utf-8"))
+        assert manifest_data["expected_requirement_ids"] == EXPECTED_REQUIREMENT_IDS
+
         acc = AcceptanceReceipt.from_dict(_build_acceptance_receipt_dict())
         RequirementTraceabilityGate.verify_acceptance_receipt(
             acc,
             repo_root=rig.repo,
-            expected_requirement_ids=EXPECTED_REQUIREMENT_IDS,
+            expected_requirement_ids=manifest_data["expected_requirement_ids"],
         )
 
         tracked_files = sorted(_git(rig.repo, "ls-files").splitlines())
@@ -1050,32 +1038,14 @@ def test_02_to_06_full_intake_queue_routing_and_dynamic_decomposition_pipeline(
         charter_context=rig.charter_context,
     )
 
-    orig_validate = DynamicDecompositionGate.validate_and_enqueue
-    captured_manifest_ids: list[str] = []
-
-    def _validate_and_capture(
-        plan_payload: Any,
-        q: OmrTaskQueue,
-        parent_task_id: str,
-        run_dir: Path | str | None = None,
-        **kw: Any,
-    ) -> DecompositionPlan:
-        plan = orig_validate(plan_payload, q, parent_task_id, run_dir=run_dir, **kw)
-        if plan.manifest_path and plan.manifest_path.exists():
-            data = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
-            captured_manifest_ids.extend(data.get("expected_requirement_ids", []))
-        for p in (Path(run_dir) / "requirements_manifest.json" if run_dir else None, rig.repo / "requirements_manifest.json"):
-            if p is not None and p.exists():
-                p.unlink()
-        return plan
-
-    monkeypatch.setattr(DynamicDecompositionGate, "validate_and_enqueue", _validate_and_capture)
-    try:
-        result = asyncio.run(
-            dispatcher.submit_task("OMR-COMPLEX-001", OMR_COMPLEX_001_PROMPT, run_id="run-02-06")
-        )
-    finally:
-        monkeypatch.setattr(DynamicDecompositionGate, "validate_and_enqueue", orig_validate)
+    result = asyncio.run(
+        dispatcher.submit_task("OMR-COMPLEX-001", OMR_COMPLEX_001_PROMPT, run_id="run-02-06")
+    )
+    assert result.decomposition_plan.manifest_path is not None
+    assert result.decomposition_plan.manifest_path.exists()
+    captured_manifest_ids = json.loads(
+        result.decomposition_plan.manifest_path.read_text(encoding="utf-8")
+    )["expected_requirement_ids"]
 
     # Bullet 2 & 3: Root task enqueued with seq_id=1, parent_task_id=None, status="enqueued" -> "routed" -> "decomposing" -> "running" -> "completed"
     assert rig.queue_path.exists()
@@ -1127,7 +1097,9 @@ def test_02_to_06_full_intake_queue_routing_and_dynamic_decomposition_pipeline(
         ],
     }
     with pytest.raises(DagValidationError):
-         orig_validate(bad_overlap_payload, OmrTaskQueue(tmp_path / "bad_q1.jsonl"), "ROOT-BAD-1")
+        DynamicDecompositionGate.validate_and_enqueue(
+            bad_overlap_payload, OmrTaskQueue(tmp_path / "bad_q1.jsonl"), "ROOT-BAD-1"
+        )
 
     # (b) Missing review/integrate node raises DagValidationError
     bad_missing_review_payload = {
@@ -1139,7 +1111,9 @@ def test_02_to_06_full_intake_queue_routing_and_dynamic_decomposition_pipeline(
         ],
     }
     with pytest.raises(DagValidationError, match="review"):
-        orig_validate(bad_missing_review_payload, OmrTaskQueue(tmp_path / "bad_q2.jsonl"), "ROOT-BAD-2")
+        DynamicDecompositionGate.validate_and_enqueue(
+            bad_missing_review_payload, OmrTaskQueue(tmp_path / "bad_q2.jsonl"), "ROOT-BAD-2"
+        )
 
     # Bullet 6: All 9 decomposed child tasks enqueued with parent_task_id="OMR-COMPLEX-001" and transitioned enqueued -> routed -> running -> completed
     for nid in expected_9_nodes:
@@ -1154,11 +1128,32 @@ def test_02_to_06_full_intake_queue_routing_and_dynamic_decomposition_pipeline(
 def test_07_specialist_skill_packs_mcps_and_tool_receipt_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Criterion 7 + Adversarial Trap A: Verify [BEGIN SPECIALIST BUNDLE], skill_packs, MCPs, _narrow_build, and SkillAndToolReceiptGate."""
+    """Criterion 7 + Adversarial Trap A: Verify [BEGIN SPECIALIST BUNDLE], skill_packs, MCPs, _narrow_build, and SkillAndToolReceiptGate via OmrDispatcher."""
     monkeypatch.setattr("raven.agent.subagent.registry.discover_product_rows", lambda: [])
     rig = OmrRepeatableTestRig(tmp_path / "skills_rig")
+    queue = OmrTaskQueue(rig.queue_path)
+    dispatcher = OmrDispatcher(
+        table=rig.table,
+        queue=queue,
+        workdir=rig.repo,
+        run_root=tmp_path / "skills_rig" / "dag_runs",
+        nodes_root=tmp_path / "skills_rig" / "dag_nodes",
+        history_root=tmp_path / "skills_rig" / "dag_history",
+        charter_context=rig.charter_context,
+    )
 
-    # Check every specialist's bundle rendering & MCP wiring through RoutingBackend
+    # Enable require_skill_evidence on all specialist backends so DagSpecialistRuntime.after_success enforces SkillAndToolReceiptGate in-pipeline
+    for s_info in SEVEN_SPECIALISTS:
+        b = rig.table.backend(s_info["name"])
+        assert isinstance(b, RoutingBackend)
+        b.require_skill_evidence = True
+
+    res = asyncio.run(
+        dispatcher.submit_task("OMR-SKILLS-001", OMR_COMPLEX_001_PROMPT, run_id="run-07-skills")
+    )
+    assert all(f["status"] == "completed" for f in res.dag_result.files)
+
+    # Also verify each specialist via dispatcher.dispatch_specialist_node() with real subprocess CommandReceipt evidence
     expected_packs_by_specialist = {s["name"]: tuple(s["skill_packs"]) for s in SEVEN_SPECIALISTS}
     expected_mcps_by_specialist = {s["name"]: tuple(s["mcp_servers"]) for s in SEVEN_SPECIALISTS}
 
@@ -1166,12 +1161,12 @@ def test_07_specialist_skill_packs_mcps_and_tool_receipt_gate(
         backend = rig.table.backend(spec_name)
         assert isinstance(backend, RoutingBackend)
         out = asyncio.run(
-            backend.run(
+            dispatcher.dispatch_specialist_node(
+                f"bundle-{spec_name}",
+                spec_name,
                 f"Verify bundle for {spec_name}",
-                task_id=f"bundle-{spec_name}",
-                workspace=rig.repo,
-                executor=None,
                 session_key="s-07",
+                require_skill_evidence=True,
             )
         )
         assert out
@@ -1182,6 +1177,10 @@ def test_07_specialist_skill_packs_mcps_and_tool_receipt_gate(
         assert f"[BEGIN SPECIALIST BUNDLE: {spec_name}]" in delivered_prompt
         for pack in packs:
             assert f"### Skill Pack: {pack}" in delivered_prompt
+            rec = backend.last_skill_evidence[pack]
+            assert "git status --porcelain" in rec.command
+            assert rec.exit_code == 0
+            assert rec.output_ref
         for mcp_srv in expected_mcps_by_specialist[spec_name]:
             assert mcp_srv in last_call["mcps"]
 
@@ -1214,32 +1213,36 @@ def test_07_specialist_skill_packs_mcps_and_tool_receipt_gate(
     assert narrowed.tools_allow == ["read_file"]
     assert narrowed.skills_allow == ["superpowers"]
 
-    # Adversarial Trap A: Rogue specialist omits required skill command receipt -> fails closed with SkillContractViolationError
+    # Adversarial Trap A: Rogue specialist omits required skill command receipt inside OmrDispatcher.submit_task() -> fails closed in DagSpecialistRuntime.after_success with SkillContractViolationError!
     rogue_rig = OmrRepeatableTestRig(tmp_path / "rogue_rig", omit_skill_evidence_for={"slice_quota"})
     rogue_backend = rogue_rig.table.backend("Engineer - Superpowers")
     rogue_backend.require_skill_evidence = True
-    asyncio.run(
-        rogue_backend.run(
-            "Implement quota slice",
-            task_id="slice_quota",
-            workspace=rogue_rig.repo,
-            executor=None,
-            session_key="s-rogue",
-        )
+    rogue_queue = OmrTaskQueue(rogue_rig.queue_path)
+    rogue_dispatcher = OmrDispatcher(
+        table=rogue_rig.table,
+        queue=rogue_queue,
+        workdir=rogue_rig.repo,
+        run_root=tmp_path / "rogue_rig" / "dag_runs",
+        nodes_root=tmp_path / "rogue_rig" / "dag_nodes",
+        history_root=tmp_path / "rogue_rig" / "dag_history",
+        charter_context=rogue_rig.charter_context,
     )
-    node_spec = DagNodeSpec(
-        id="slice_quota",
-        subagent="Engineer - Superpowers",
-        node_summary="quota",
-        prompt_template="quota",
-        execution_kind="write",
-        file_scope=["src/quota/**"],
+    rogue_res = asyncio.run(
+        rogue_dispatcher.submit_task("OMR-ROGUE-001", OMR_COMPLEX_001_PROMPT, run_id="run-rogue")
     )
+    rogue_map = {f["node"]: f for f in rogue_res.dag_result.files}
+    assert rogue_map["slice_quota"]["status"] == "failed"
+    assert "superpowers" in (rogue_map["slice_quota"]["error"] or "")
+    assert rogue_queue.latest_by_task()["OMR-ROGUE-001"].status == "failed"
+
     with pytest.raises(SkillContractViolationError, match="superpowers"):
-        SkillAndToolReceiptGate.verify_specialist_execution(
-            node_spec,
-            rogue_backend,
-            require_skill_evidence=True,
+        asyncio.run(
+            rogue_dispatcher.dispatch_specialist_node(
+                "slice_quota",
+                "Engineer - Superpowers",
+                "Implement quota slice",
+                require_skill_evidence=True,
+            )
         )
 
 
@@ -1297,6 +1300,7 @@ def test_08_cto_and_reviewer_remediation_and_rtm_ast_gate(
         )
 
     # 3. Run full CTO -> Write Slices -> Integrate -> Review Pass 1 (changes_requested) -> Remediate -> Re-Review Pass 2 (approved)
+    # with requirements_manifest.json intact in run_dir throughout the entire run!
     queue = OmrTaskQueue(rig.queue_path)
     dispatcher = OmrDispatcher(
         table=rig.table,
@@ -1307,20 +1311,9 @@ def test_08_cto_and_reviewer_remediation_and_rtm_ast_gate(
         history_root=tmp_path / "cto_rev_rig" / "dag_history",
         charter_context=rig.charter_context,
     )
-    orig_validate = DynamicDecompositionGate.validate_and_enqueue
-
-    def _validate_no_early_manifest(plan_payload: Any, q: OmrTaskQueue, parent_task_id: str, run_dir: Path | str | None = None, **kw: Any) -> DecompositionPlan:
-        plan = orig_validate(plan_payload, q, parent_task_id, run_dir=run_dir, **kw)
-        for p in (Path(run_dir) / "requirements_manifest.json" if run_dir else None, rig.repo / "requirements_manifest.json"):
-            if p is not None and p.exists():
-                p.unlink()
-        return plan
-
-    monkeypatch.setattr(DynamicDecompositionGate, "validate_and_enqueue", _validate_no_early_manifest)
-    try:
-        res = asyncio.run(dispatcher.submit_task("OMR-COMPLEX-001", OMR_COMPLEX_001_PROMPT, run_id="r-remediate"))
-    finally:
-        monkeypatch.setattr(DynamicDecompositionGate, "validate_and_enqueue", orig_validate)
+    res = asyncio.run(dispatcher.submit_task("OMR-COMPLEX-001", OMR_COMPLEX_001_PROMPT, run_id="r-remediate"))
+    assert res.decomposition_plan.manifest_path is not None
+    assert res.decomposition_plan.manifest_path.exists()
 
     node_map = {f["node"]: f for f in res.dag_result.files}
     assert node_map["review"]["status"] == "completed"
@@ -1384,36 +1377,68 @@ def test_08_cto_and_reviewer_remediation_and_rtm_ast_gate(
 def test_09_harness_pool_distribution_and_workload_learning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Criterion 9: 5 onboarded harnesses distribute initial tasks evenly via dispatch/in-flight tie-breaking and shift dynamically on telemetry."""
+    """Criterion 9: 5 onboarded harnesses distribute concurrent in-flight tasks across all 5 harnesses via inflight_count tie-breaking and shift dynamically on telemetry."""
     monkeypatch.setattr("raven.agent.subagent.registry.discover_product_rows", lambda: [])
     rig = OmrRepeatableTestRig(tmp_path / "dist_rig")
+    queue = OmrTaskQueue(rig.queue_path)
+    dispatcher = OmrDispatcher(
+        table=rig.table,
+        queue=queue,
+        workdir=rig.repo,
+        run_root=tmp_path / "dist_rig" / "dag_runs",
+        nodes_root=tmp_path / "dist_rig" / "dag_nodes",
+        history_root=tmp_path / "dist_rig" / "dag_history",
+        charter_context=rig.charter_context,
+    )
 
-    # Disable telemetry file during cold-start round-robin check so all 5 harnesses have identical (0.0, 0.0) workload scores
+    # Disable telemetry file during concurrent cold-start check so all 5 harnesses have identical (0.0, 0.0) workload scores
     for row in rig.table.rows():
         b = rig.table._backends.get(row.name)
         if isinstance(b, RoutingBackend):
             b._telemetry_path = None
 
-    chosen_harnesses: list[str] = []
-    for i in range(5):
-        spec_name = SEVEN_SPECIALISTS[i]["name"]
-        b = rig.table.backend(spec_name)
-        assert isinstance(b, RoutingBackend)
-        asyncio.run(
-            b.run(
-                f"Cold start task {i}",
-                task_id=f"cold-{i}",
-                workspace=rig.repo,
-                executor=None,
-                session_key="s-dist",
+    # Install an asyncio barrier across the 5 harness backends so all 5 tasks are simultaneously in-flight (inflight_count > 0)
+    async def _run_concurrent_inflight_distribution() -> list[str]:
+        all_entered = asyncio.Event()
+        entered_harnesses: list[str] = []
+
+        for hname, hb in rig.harness_backends.items():
+            orig_run = hb.run
+
+            async def _barrier_run(
+                task: str,
+                *,
+                _orig: Any = orig_run,
+                _hname: str = hname,
+                **kw: Any,
+            ) -> str:
+                entered_harnesses.append(_hname)
+                if len(entered_harnesses) >= 5:
+                    all_entered.set()
+                await asyncio.wait_for(all_entered.wait(), timeout=10.0)
+                return await _orig(task, **kw)
+
+            hb.run = _barrier_run  # type: ignore[method-assign]
+
+        await asyncio.gather(
+            *(
+                dispatcher.dispatch_specialist_node(
+                    f"concurrent-cold-{i}",
+                    SEVEN_SPECIALISTS[i]["name"],
+                    f"Concurrent cold start task {i}",
+                    session_key="s-dist",
+                )
+                for i in range(5)
             )
         )
-        chosen_harnesses.append(b.last_chosen_backend)
+        return entered_harnesses
 
-    # All 5 onboarded harnesses (including builtin Raven-General) must be selected once across the 5 dispatches!
-    assert set(chosen_harnesses) == set(FIVE_HARNESSES)
+    concurrent_harnesses = asyncio.run(_run_concurrent_inflight_distribution())
+    # All 5 onboarded harnesses (including builtin Raven-General) must be selected simultaneously across the 5 concurrent in-flight dispatches!
+    assert len(concurrent_harnesses) == 5
+    assert set(concurrent_harnesses) == set(FIVE_HARNESSES)
 
-    # Now enable telemetry with varying latency/pass rates and verify workload learning shifts traffic to the fastest 100%-passing harness
+    # Now enable telemetry with varying latency/pass rates and verify workload learning shifts traffic to the fastest 100%-passing harness via OmrDispatcher
     tpath = tmp_path / "dist_rig" / "learned_telemetry.jsonl"
     seeded_rows = [
         {"chosen_backend": "Hermes", "final_status": "failed", "total_duration_ms": 900.0},
@@ -1427,8 +1452,15 @@ def test_09_harness_pool_distribution_and_workload_learning(
     cto_b = rig.table.backend("CTO")
     assert isinstance(cto_b, RoutingBackend)
     cto_b._telemetry_path = tpath
-    picked = asyncio.run(cto_b.pick("Strategic review", session_key="s-learned", instance=None))
-    assert picked.name == "Claude-Code"
+    asyncio.run(
+        dispatcher.dispatch_specialist_node(
+            "learned-dispatch-1",
+            "CTO",
+            "Strategic review under learned telemetry",
+            session_key="s-learned",
+        )
+    )
+    assert queue.latest_by_task()["learned-dispatch-1"].assigned_harness == "Claude-Code"
 
 
 @pytest.mark.slow
@@ -1459,7 +1491,7 @@ def test_10_tunnel_view_semantic_trap_and_secret_redaction(
     assert "topsecret999" not in charter
     assert "[REDACTED]" in charter
 
-    # 2. Run pipeline with tunnel_view_float_trap=True on slice_quota:
+    # 2. Run pipeline with tunnel_view_float_trap=True on slice_quota (with requirements_manifest.json kept intact in run_dir!):
     # slice_quota initially commits float math -> Reviewer Pass 1 rejects citing [ARCH-DEC-09] -> remediate replaces float with Decimal -> Pass 2 approves!
     rig = OmrRepeatableTestRig(tmp_path / "trap_rig", tunnel_view_float_trap=True)
     queue = OmrTaskQueue(rig.queue_path)
@@ -1472,20 +1504,9 @@ def test_10_tunnel_view_semantic_trap_and_secret_redaction(
         history_root=tmp_path / "trap_rig" / "dag_history",
         charter_context=rig.charter_context,
     )
-    orig_validate = DynamicDecompositionGate.validate_and_enqueue
-
-    def _validate_no_early_manifest(plan_payload: Any, q: OmrTaskQueue, parent_task_id: str, run_dir: Path | str | None = None, **kw: Any) -> DecompositionPlan:
-        plan = orig_validate(plan_payload, q, parent_task_id, run_dir=run_dir, **kw)
-        for p in (Path(run_dir) / "requirements_manifest.json" if run_dir else None, rig.repo / "requirements_manifest.json"):
-            if p is not None and p.exists():
-                p.unlink()
-        return plan
-
-    monkeypatch.setattr(DynamicDecompositionGate, "validate_and_enqueue", _validate_no_early_manifest)
-    try:
-        res = asyncio.run(dispatcher.submit_task("OMR-COMPLEX-001", OMR_COMPLEX_001_PROMPT, run_id="r-trap"))
-    finally:
-        monkeypatch.setattr(DynamicDecompositionGate, "validate_and_enqueue", orig_validate)
+    res = asyncio.run(dispatcher.submit_task("OMR-COMPLEX-001", OMR_COMPLEX_001_PROMPT, run_id="r-trap"))
+    assert res.decomposition_plan.manifest_path is not None
+    assert res.decomposition_plan.manifest_path.exists()
 
     # Verify Reviewer Pass 1 caught the ARCH-DEC-09 float violation
     review_out_path = tmp_path / "trap_rig" / "dag_nodes" / "review.out.md"
@@ -1507,11 +1528,21 @@ def test_10_tunnel_view_semantic_trap_and_secret_redaction(
 def test_11_seven_by_five_specialist_harness_matrix_hot_onboarding_and_crash_failover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Criterion 11 + Adversarial Traps C & F: 7 Specialists x 5 Harnesses = 35 permutations, hot-onboarding 6th harness (Cursor-ACP), clean crash failover, and dirty worktree quarantine."""
+    """Criterion 11 + Adversarial Traps C & F: 7 Specialists x 5 Harnesses = 35 permutations, hot-onboarding 6th harness (Cursor-ACP), clean crash failover, and dirty worktree quarantine via OmrDispatcher."""
     monkeypatch.setattr("raven.agent.subagent.registry.discover_product_rows", lambda: [])
     rig = OmrRepeatableTestRig(tmp_path / "matrix_rig")
+    queue = OmrTaskQueue(rig.queue_path)
+    dispatcher = OmrDispatcher(
+        table=rig.table,
+        queue=queue,
+        workdir=rig.repo,
+        run_root=tmp_path / "matrix_rig" / "dag_runs",
+        nodes_root=tmp_path / "matrix_rig" / "dag_nodes",
+        history_root=tmp_path / "matrix_rig" / "dag_history",
+        charter_context=rig.charter_context,
+    )
 
-    # 1. Execute all 7 Specialists x 5 Onboarded Harnesses = 35 permutations
+    # 1. Execute all 7 Specialists x 5 Onboarded Harnesses = 35 permutations through OmrDispatcher
     executed_pairs: set[tuple[str, str]] = set()
     for s_info in SEVEN_SPECIALISTS:
         spec_name = s_info["name"]
@@ -1529,17 +1560,20 @@ def test_11_seven_by_five_specialist_harness_matrix_hot_onboarding_and_crash_fai
                 if other_h != target_harness:
                     routing_entry._cooldown_until[other_h] = routing_entry._clock() + 3600.0
 
+            tid = f"matrix::{spec_name}::{target_harness}"
             res_str = asyncio.run(
-                routing_entry.run(
+                dispatcher.dispatch_specialist_node(
+                    tid,
+                    spec_name,
                     f"Matrix run {spec_name} on {target_harness}",
-                    task_id=f"matrix::{spec_name}::{target_harness}",
-                    workspace=rig.repo,
-                    executor=None,
                     session_key="s-matrix",
+                    require_skill_evidence=True,
                 )
             )
             assert res_str
             assert routing_entry.last_chosen_backend == target_harness
+            assert queue.latest_by_task()[tid].assigned_harness == target_harness
+            assert queue.latest_by_task()[tid].status == "completed"
             hb = rig.harness_backends[target_harness]
             last_call = hb.calls[-1]
             assert f"[BEGIN SPECIALIST BUNDLE: {spec_name}]" in last_call["task"]
@@ -1552,7 +1586,7 @@ def test_11_seven_by_five_specialist_harness_matrix_hot_onboarding_and_crash_fai
 
     assert len(executed_pairs) == 35
 
-    # 2. Hot-onboard a 6th harness (Cursor-ACP) via table.apply() with ZERO changes to any specialist config
+    # 2. Hot-onboard a 6th harness (Cursor-ACP) via table.apply() with ZERO changes to any specialist config, and run all 7 specialists via OmrDispatcher
     cursor_backend = DeterministicHarnessBackend(
         "Cursor-ACP",
         kind="acp",
@@ -1567,29 +1601,31 @@ def test_11_seven_by_five_specialist_harness_matrix_hot_onboarding_and_crash_fai
         command="echo",
         is_harness=True,
     )
-    rig._build_table(extra_harnesses=[cursor_cfg])
-    # Re-read from newly applied table
     hot_table = rig._build_table(extra_harnesses=[cursor_cfg])
+    dispatcher.table = hot_table
     for s_info in SEVEN_SPECIALISTS:
         spec_name = s_info["name"]
         b = hot_table.backend(spec_name)
         assert isinstance(b, RoutingBackend)
         assert "Cursor-ACP" in [t.name for t in b._targets]
-        # Cool down the original 5 harnesses and verify the specialist runs on Cursor-ACP
+        # Cool down the original 5 harnesses and verify the specialist runs on Cursor-ACP through OmrDispatcher
         for h in FIVE_HARNESSES:
             b._cooldown_until[h] = b._clock() + 3600.0
+        hot_tid = f"hot::{spec_name}"
         asyncio.run(
-            b.run(
+            dispatcher.dispatch_specialist_node(
+                hot_tid,
+                spec_name,
                 f"Run {spec_name} on hot-onboarded Cursor-ACP",
-                task_id=f"hot::{spec_name}",
-                workspace=rig.repo,
-                executor=None,
                 session_key="s-hot",
+                require_skill_evidence=True,
             )
         )
         assert b.last_chosen_backend == "Cursor-ACP"
+        assert queue.latest_by_task()[hot_tid].assigned_harness == "Cursor-ACP"
+        b._cooldown_until.clear()
 
-    # 3. Adversarial Trap C1: Mid-flight clean harness crash -> specialist migrates to next harness with full bundle
+    # 3. Adversarial Trap C1: Mid-flight clean harness crash inside OmrDispatcher -> specialist migrates to next harness with full bundle
     crash_calls = 0
 
     class _CrashingCleanHarness:
@@ -1603,7 +1639,7 @@ def test_11_seven_by_five_specialist_harness_matrix_hot_onboarding_and_crash_fai
             crash_calls += 1
             raise TimeoutError("Hermes timed out before touching worktree")
 
-    eng_b = rig.table.backend("Engineer - Superpowers")
+    eng_b = hot_table.backend("Engineer - Superpowers")
     assert isinstance(eng_b, RoutingBackend)
     eng_b._cooldown_until.clear()
     eng_b._targets[0] = RouteTarget(
@@ -1615,22 +1651,24 @@ def test_11_seven_by_five_specialist_harness_matrix_hot_onboarding_and_crash_fai
         model="hermes-m1",
     )
     failover_out = asyncio.run(
-        eng_b.run(
+        dispatcher.dispatch_specialist_node(
+            "clean-failover-1",
+            "Engineer - Superpowers",
             "Task surviving clean harness crash",
-            task_id="clean-failover-1",
-            workspace=rig.repo,
-            executor=None,
             session_key="s-failover",
             writes=True,
             idempotent=True,
+            require_skill_evidence=True,
         )
     )
     assert failover_out
     assert crash_calls == 1
     assert eng_b.last_chosen_backend != "Hermes"
     assert eng_b._is_cooled_down("Hermes") is True
+    assert queue.latest_by_task()["clean-failover-1"].status == "completed"
+    assert queue.latest_by_task()["clean-failover-1"].assigned_harness != "Hermes"
 
-    # 4. Adversarial Trap C2: Dirty worktree crash blocks failover with SubagentFailoverBlockedError & quarantines in DurableRecoveryLedger
+    # 4. Adversarial Trap C2: Dirty worktree crash inside OmrDispatcher blocks failover with SubagentFailoverBlockedError & quarantines in DurableRecoveryLedger
     dirty_wt = WorktreeManager().provision_worktree(
         rig.repo, rig.worktrees_root, "dirtyrun", "slice_dirty", rig.base_sha
     )
@@ -1649,13 +1687,14 @@ def test_11_seven_by_five_specialist_harness_matrix_hot_onboarding_and_crash_fai
         "Engineer - ECC",
         _DirtyCrashingHarness(),  # type: ignore[arg-type]
         [
-        RouteTarget("DirtyHarness", "dirty", _DirtyCrashingHarness(), fallback=True, priority=0),  # type: ignore[arg-type]
-        RouteTarget("Copilot", "clean backup", rig.harness_backends["Copilot"], fallback=True, priority=1),
+            RouteTarget("DirtyHarness", "dirty", _DirtyCrashingHarness(), fallback=True, priority=0),  # type: ignore[arg-type]
+            RouteTarget("Copilot", "clean backup", rig.harness_backends["Copilot"], fallback=True, priority=1),
         ],
         instances=type("_Inst", (), {"list_instances": lambda self, s=None: []})(),
         telemetry_path=rig.telemetry_path,
         is_dynamic_specialist=True,
     )
+    hot_table._backends["Engineer - ECC"] = dirty_entry
     rt_dirty = DagSpecialistRuntime(workdir=rig.repo, run_dir=tmp_path / "dirty_run_dir")
     spec_dirty = SubAgentDagSpec(
         task_summary="dirty test",
@@ -1676,11 +1715,11 @@ def test_11_seven_by_five_specialist_harness_matrix_hot_onboarding_and_crash_fai
     with pytest.raises(SubagentFailoverBlockedError) as exc_info:
         try:
             asyncio.run(
-                dirty_entry.run(
+                dispatcher.dispatch_specialist_node(
+                    "slice_dirty",
+                    "Engineer - ECC",
                     "Write quota slice",
-                    task_id="slice_dirty",
                     workspace=dirty_wt,
-                    executor=None,
                     writes=True,
                     idempotent=True,
                 )
@@ -1689,6 +1728,7 @@ def test_11_seven_by_five_specialist_harness_matrix_hot_onboarding_and_crash_fai
             rt_dirty.on_failure(spec_dirty.nodes[0], "Write quota slice", exc)
             raise
 
+    assert queue.latest_by_task()["slice_dirty"].status == "failed"
     assert exc_info.value.attempt_receipts[0]["status"] == "blocked_dirty_worktree"
     assert "corrupt_partial.py" in exc_info.value.attempt_receipts[0]["dirty_paths"]
     assert rt_dirty.ledger is not None
