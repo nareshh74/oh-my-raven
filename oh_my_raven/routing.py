@@ -348,6 +348,7 @@ class RoutingBackend(SubagentBackend):
         instances: Any,
         target_ready: TargetReady | None = None,
         max_failovers: int = 2,
+        max_attempts: int | None = None,
         cooldown_s: float = 60.0,
         max_review_cycles: int = 3,
         clock: Callable[[], float] = time.monotonic,
@@ -371,6 +372,10 @@ class RoutingBackend(SubagentBackend):
         self._target_ready = target_ready
         self._router: Router | None = None
         self._max_failovers = max(0, int(max_failovers))
+        # Conductor revival: when set, the chain is cycled (dead implementors are
+        # re-spawned) until exactly this many attempts have been made.
+        self._max_attempts = max(1, int(max_attempts)) if max_attempts is not None else None
+        self.last_attempts: list[dict[str, Any]] = []
         self._cooldown_s = float(cooldown_s)
         self.max_review_cycles = max(1, int(max_review_cycles))
         self._clock = clock
@@ -1079,9 +1084,13 @@ class RoutingBackend(SubagentBackend):
             handed=handed,
         )
         chain = self.failover_chain(picked, mode=mode, handed=handed, session_key=session_key)
+        if self._max_attempts is not None:
+            base_chain = chain[: max(1, min(len(chain), self._max_attempts))]
+            chain = [base_chain[i % len(base_chain)] for i in range(self._max_attempts)]
         first_model = self._model_for(chain[0].name, chain[0].backend, call_kwargs)
         run_start = self._clock()
         attempt_records: list[dict[str, Any]] = []
+        self.last_attempts = attempt_records
         last_exc: BaseException | None = None
         telemetry_extra = {
             "skill_packs_injected": skill_packs_injected,
