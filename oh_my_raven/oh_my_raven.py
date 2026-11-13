@@ -12,7 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
 
@@ -22,7 +22,7 @@ from raven.agent.subagent.dag_graph import DagNodeSpec
 from raven.agent.subagent.prompt_errors import DagValidationError
 from raven.contracts.subagent_backend import SubagentBackend, SubagentNoAnswerError
 from .gate import LessonsStore, TriageDecision, classify_triage_tier, escalate_triage_tier, evaluate_council_consensus, GatePolicy, has_verifiable_evidence
-from .routing import RouteTarget, RoutingBackend
+from .routing import RouteTarget, RoutingBackend, SubagentRetryableError
 
 BRAND_NAME = "oh-my-raven"
 
@@ -58,11 +58,26 @@ class SpecialistDefinition:
     mcp_servers: tuple[str, ...] = ()
     required_capabilities: tuple[str, ...] = ()
     is_harness: bool = False
+    slug: str = ""
+    specialist_dir: str = ""
+    agents_md_path: str = ""
+    disabled_skills: tuple[str, ...] = ()
+    disabled_mcp_servers: tuple[str, ...] = ()
+    strict_mcp_scope: bool = False
+    plugins: tuple[str, ...] = ()
+    disabled_plugins: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] = ()
+    denied_tools: tuple[str, ...] = ()
+    mcp_server_configs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def from_obj(cls, obj: Any) -> "SpecialistDefinition":
         if isinstance(obj, SpecialistDefinition):
             return obj
+        if isinstance(obj, (str, Path)):
+            path = Path(obj)
+            if path.name.upper() == "AGENTS.MD" or (path.is_dir() and (path / "AGENTS.md").is_file()):
+                return cls.from_agents_md(path)
         read = obj.get if isinstance(obj, dict) else lambda k, d=None: getattr(obj, k, d)
         name = str(read("name", "") or "")
         kind = str(read("kind", "") or "")
@@ -89,7 +104,7 @@ class SpecialistDefinition:
         if is_harness_raw is None:
             is_harness_raw = read("isHarness", None)
         is_harness = False if kind == "specialist" else (True if is_harness_raw is None else bool(is_harness_raw))
-        return cls(
+        values = dict(
             name=name,
             role_prompt=role_prompt,
             soul_path=soul_path,
@@ -98,11 +113,73 @@ class SpecialistDefinition:
             mcp_servers=mcp_servers,
             required_capabilities=req_caps,
             is_harness=is_harness,
+            slug=str(read("slug", "") or ""), specialist_dir=str(read("specialist_dir", "") or ""),
+            agents_md_path=str(read("agents_md_path", "") or ""),
+            disabled_skills=tuple(read("disabled_skills", ()) or ()),
+            disabled_mcp_servers=tuple(read("disabled_mcp_servers", ()) or ()),
+            strict_mcp_scope=bool(read("strict_mcp_scope", False)), plugins=tuple(read("plugins", ()) or ()),
+            disabled_plugins=tuple(read("disabled_plugins", ()) or ()), allowed_tools=tuple(read("allowed_tools", ()) or ()),
+            denied_tools=tuple(read("denied_tools", ()) or ()), mcp_server_configs=dict(read("mcp_server_configs", {}) or {}),
         )
+        agents_path = Path(values["agents_md_path"]) if values["agents_md_path"] else None
+        if agents_path and agents_path.is_file() and not values["role_prompt"]:
+            loaded = cls.from_agents_md(agents_path)
+            for key in values:
+                if values[key] in ("", (), {}, False) and getattr(loaded, key) not in ("", (), {}, False):
+                    values[key] = getattr(loaded, key)
+        return cls(**values)
+
+    @property
+    def resolved_slug(self) -> str:
+        return self.slug.strip() or _slugify_specialist(self.name)
 
     @property
     def has_specialist_bundle(self) -> bool:
-        return bool(self.role_prompt.strip() or self.soul_path.strip() or self.skill_packs or self.mcp_servers)
+        return bool(self.role_prompt.strip() or self.soul_path.strip() or self.skill_packs or self.mcp_servers or self.specialist_dir.strip() or self.agents_md_path.strip() or self.plugins)
+
+    def to_agents_md(self, *, resolved_skills_dir: Path | str | None = None) -> str:
+        meta = {k: v for k, v in (("name", self.name), ("slug", self.resolved_slug), ("required_capabilities", list(self.required_capabilities)), ("skill_packs", list(self.skill_packs)), ("disabled_skills", list(self.disabled_skills)), ("mcp_servers", list(self.mcp_servers)), ("disabled_mcp_servers", list(self.disabled_mcp_servers)), ("strict_mcp_scope", bool(self.strict_mcp_scope)), ("plugins", list(self.plugins)), ("disabled_plugins", list(self.disabled_plugins)), ("allowed_tools", list(self.allowed_tools)), ("denied_tools", list(self.denied_tools)))}
+        try:
+            import yaml
+            front = yaml.safe_dump(meta, sort_keys=False)
+        except ImportError:
+            front = "\n".join(f"{k}: {json.dumps(v)}" for k, v in meta.items()) + "\n"
+        soul = SkillPackResolver.resolve_soul_text(self) or f"You are {self.name}, a specialized oh-my-raven agent."
+        body = f"# Specialist: {self.name}\n\n<!-- BEGIN ROLE PROMPT -->\n{soul}\n<!-- END ROLE PROMPT -->\n"
+        if self.skill_packs:
+            root = Path(resolved_skills_dir) if resolved_skills_dir else Path("skills")
+            body += "\n## Linked Skill Packs\n" + "".join(f"- {p}: {root / p / 'SKILL.md'}\n" for p in self.skill_packs)
+        if self.mcp_servers or self.disabled_mcp_servers:
+            body += f"\n## MCP Scope\nEnabled: {', '.join(self.mcp_servers)}\nDisabled: {', '.join(self.disabled_mcp_servers)}\nstrict_mcp_scope={self.strict_mcp_scope}\n"
+        return f"---\n{front}---\n{body}"
+
+    @classmethod
+    def from_agents_md(cls, path: Path | str) -> "SpecialistDefinition":
+        agents = Path(path).expanduser(); agents = agents / "AGENTS.md" if agents.is_dir() else agents
+        raw = agents.read_text(encoding="utf-8"); meta: dict[str, Any] = {}; body = raw
+        if raw.startswith("---\n") and "\n---\n" in raw[4:]:
+            front, body = raw[4:].split("\n---\n", 1)
+            try:
+                import yaml
+                meta = yaml.safe_load(front) or {}
+            except ImportError:
+                for line in front.splitlines():
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        try: meta[k.strip()] = json.loads(v.strip())
+                        except json.JSONDecodeError: meta[k.strip()] = v.strip()
+        match = re.search(r"<!-- BEGIN ROLE PROMPT -->\s*(.*?)\s*<!-- END ROLE PROMPT -->", body, re.S)
+        role = match.group(1).strip() if match else re.split(r"\n## (?:Linked Skill Packs|MCP Scope)\n", re.sub(r"^# Specialist:.*\n+", "", body).strip())[0].strip()
+        parent = agents.parent.resolve(); skills = parent / "skills"
+        meta.update(role_prompt=role, specialist_dir=str(parent), agents_md_path=str(agents.resolve()))
+        if skills.is_dir(): meta["skill_dirs"] = tuple(meta.get("skill_dirs", ())) + ((str(skills),) if str(skills) not in meta.get("skill_dirs", ()) else ())
+        mcp = parent / "mcp.json"
+        if mcp.is_file(): meta["mcp_server_configs"] = json.loads(mcp.read_text(encoding="utf-8")).get("mcpServers", {})
+        return cls.from_obj(meta)
+
+
+def _slugify_specialist(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-") or "specialist"
 
 
 _PORTABLE_SKILL_PACK_LIBRARY: dict[str, str] = {
@@ -209,6 +286,12 @@ class SkillPackResolver:
         if "[BEGIN SPECIALIST BUNDLE:" in task_prompt:
             return task_prompt
         sections: list[str] = [f"[BEGIN SPECIALIST BUNDLE: {spec.name or 'Specialist'}]"]
+        if spec.specialist_dir or spec.agents_md_path:
+            sections.append(
+                "## Specialist Folder & AGENTS.md\n"
+                f"Specialist Directory: {spec.specialist_dir}\nAGENTS.md Path: {spec.agents_md_path}\n"
+                f"Skills Directory: {Path(spec.specialist_dir) / 'skills'}\nMCP Config Path: {Path(spec.specialist_dir) / 'mcp.json'}"
+            )
         soul = cls.resolve_soul_text(spec)
         if soul:
             sections.append(f"## Specialist Role & Charter\n{_SECRET.sub('[REDACTED]', soul)}")
@@ -231,6 +314,91 @@ class SkillPackResolver:
 
 
 SkillPackInjector = SkillPackResolver
+
+
+class SpecialistFolderManager:
+    @staticmethod
+    def _find(root: Path, name: str) -> Path | None:
+        for candidate in (root / name, root / name.lower()):
+            if candidate.is_dir() and ((candidate / "SKILL.md").is_file() or any(candidate.iterdir())):
+                return candidate.resolve()
+        if root.name == "profiles" and root.is_dir():
+            return next((p.parent for p in root.glob(f"*/skills/{name}/SKILL.md")), None)
+        return None
+
+    @classmethod
+    def ensure_specialist_dir(cls, specialist: SpecialistDefinition | Any, specialists_root: Path | str, *, extra_skill_roots: Sequence[str | Path] = (), extra_plugin_roots: Sequence[str | Path] = ()) -> SpecialistDefinition:
+        spec = SpecialistDefinition.from_obj(specialist); spec_dir = Path(specialists_root).expanduser().resolve() / spec.resolved_slug
+        skills_dir, plugins_dir = spec_dir / "skills", spec_dir / "plugins"
+        skills_dir.mkdir(parents=True, exist_ok=True); plugins_dir.mkdir(parents=True, exist_ok=True)
+        def materialize(src: Path | None, dst: Path) -> None:
+            if dst.exists() or dst.is_symlink(): return
+            if src and src.resolve() != dst.resolve():
+                try: os.symlink(src, dst, target_is_directory=True); return
+                except OSError:
+                    if os.name == "nt" and subprocess.run(["cmd", "/c", "mklink", "/J", str(dst), str(src)], capture_output=True).returncode == 0: return
+                    shutil.copytree(src, dst, dirs_exist_ok=True); return
+            dst.mkdir(parents=True, exist_ok=True)
+        roots = tuple(Path(p).expanduser() for p in (*spec.skill_dirs, *extra_skill_roots)) + SkillPackResolver.DEFAULT_SKILL_SEARCH_ROOTS
+        for pack in spec.skill_packs:
+            if pack in spec.disabled_skills: continue
+            src = next((found for root in roots if (found := cls._find(root, pack))), None); target = skills_dir / pack
+            materialize(src, target)
+            if not (target / "SKILL.md").is_file(): (target / "SKILL.md").write_text(SkillPackResolver.resolve_skill_pack_text(pack, extra_dirs=spec.skill_dirs), encoding="utf-8")
+        for plugin in spec.plugins:
+            if plugin in spec.disabled_plugins: continue
+            src = next((p / plugin for p in map(Path, extra_plugin_roots) if (p / plugin).is_dir()), None); target = plugins_dir / plugin
+            materialize(src, target)
+            if not any(target.iterdir()): (target / "plugin.json").write_text(json.dumps({"name": plugin, "enabled": True}, indent=2), encoding="utf-8")
+        servers = {s: spec.mcp_server_configs.get(s, {"type": "stdio", "command": s, "args": [], "enabled": True}) for s in spec.mcp_servers if s not in spec.disabled_mcp_servers}
+        _write_json(spec_dir / "mcp.json", {"_omr_meta": {"enabled": list(spec.mcp_servers), "disabled": list(spec.disabled_mcp_servers), "strict_mcp_scope": bool(spec.strict_mcp_scope)}, "mcpServers": servers})
+        agents = spec_dir / "AGENTS.md"; agents.write_text(spec.to_agents_md(resolved_skills_dir=skills_dir), encoding="utf-8")
+        return dataclass_replace(spec, slug=spec.resolved_slug, specialist_dir=str(spec_dir), agents_md_path=str(agents), skill_dirs=(str(skills_dir), *spec.skill_dirs))
+
+
+class SessionHarnessFlagBuilder:
+    @classmethod
+    def detect_harness_family(cls, harness_name: str, backend: Any = None) -> str:
+        value = " ".join((harness_name, str(getattr(backend, "command", "")), str(getattr(backend, "kind", "")))).lower()
+        return next((x for x in ("claude", "codex", "copilot", "hermes") if x in value), "generic")
+
+    @classmethod
+    def build_for_candidate(cls, specialist: SpecialistDefinition | Any, harness_name: str, *, backend: Any = None) -> dict[str, Any]:
+        s = SpecialistDefinition.from_obj(specialist); d = Path(s.specialist_dir) if s.specialist_dir else None; family = cls.detect_harness_family(harness_name, backend)
+        agents = str(s.agents_md_path or (d / "AGENTS.md" if d else "")); mcp = str(d / "mcp.json") if d else ""; skills = str(d / "skills") if d else ""
+        ask=[x for x in s.skill_packs if x not in s.disabled_skills]; am=[x for x in s.mcp_servers if x not in s.disabled_mcp_servers]; dm=list(s.disabled_mcp_servers); ap=[x for x in s.plugins if x not in s.disabled_plugins]; dp=list(s.disabled_plugins); a=[]
+        if family == "claude":
+            if d: a += ["--add-dir", str(d)]
+            if s.strict_mcp_scope: a += ["--strict-mcp-config"]
+            if mcp and (am or s.strict_mcp_scope): a += ["--mcp-config", mcp]
+            for p in ap: a += ["--plugin-dir", str(d / "plugins" / p) if d else p]
+            if s.allowed_tools: a += ["--allowedTools", ",".join(s.allowed_tools)]
+            dis=list(s.denied_tools)+[f"mcp__{m}__*" for m in dm]
+            if dis: a += ["--disallowedTools", ",".join(dis)]
+        elif family == "codex":
+            if skills: a += ["-c", f'skills.dirs=["{skills.replace(chr(92), "/")}"]']
+            for m in am: a += ["-c", f"mcp_servers.{m}.enabled=true"]
+            for m in dm: a += ["-c", f"mcp_servers.{m}.enabled=false"]
+            for p in ap: a += ["--enable", p]
+            for p in dp: a += ["--disable", p]
+        elif family == "copilot":
+            if d: a += ["--add-dir", str(d)]
+            if s.strict_mcp_scope: a += ["--disable-builtin-mcps"]
+            if mcp and am: a += ["--additional-mcp-config", "@"+mcp]
+            for m in am: a += ["--enable-mcp-server", m]
+            for m in dm: a += ["--disable-mcp-server", m]
+            for p in ap: a += ["--plugin-dir", str(d / "plugins" / p) if d else p]
+            if s.allowed_tools: a += ["--available-tools", ",".join(s.allowed_tools)]
+            if s.denied_tools: a += ["--excluded-tools", ",".join(s.denied_tools)]
+        elif family == "hermes":
+            if ask: a += ["-s", ",".join(ask)]
+            tools=list(s.allowed_tools)+[m if m.startswith("mcp-") else "mcp-"+m for m in am]
+            if tools: a += ["-t", ",".join(tools)]
+            if dp: a += ["--safe-mode"]
+        else:
+            if d: a += ["--add-dir", str(d)]
+            if mcp and am: a += ["--mcp-config", mcp]
+        return {"harness_family":family,"specialist_dir":str(d) if d else "","agents_md_path":agents,"session_mcp_config":mcp,"session_cli_args":tuple(a),"mcps_enabled":tuple(am),"mcps_disabled":tuple(dm),"plugins_enabled":tuple(ap),"plugins_disabled":tuple(dp),"skills_enabled":tuple(ask),"skills_disabled":tuple(s.disabled_skills)}
 
 
 class DirtyBaselineError(RuntimeError):
@@ -261,7 +429,7 @@ class PrematureCompletionError(RuntimeError):
     """Raised when an AcceptanceReceipt fails the RequirementTraceabilityGate."""
 
 
-class SkillContractViolationError(RuntimeError):
+class SkillContractViolationError(SubagentRetryableError):
     """Raised when a specialist omits required skill/tool/MCP execution evidence."""
 
 
@@ -2283,11 +2451,13 @@ class OmrDispatcher:
         intake_router: Callable[[list[tuple[str, str]], str, str], Any] | None = None,
         charter_context: dict[str, Any] | None = None,
         gate_policy_path: Path | str | None = None,
+        specialists_root: Path | str | None = None,
     ) -> None:
         self.table = table
         self.queue = queue
         self.workdir = Path(workdir)
         self.run_root = Path(run_root)
+        self.specialists_root = Path(specialists_root) if specialists_root is not None else self.run_root.parent / "specialists"
         self.nodes_root = Path(nodes_root)
         self.history_root = Path(history_root)
         self.intake_router = intake_router
@@ -2327,6 +2497,9 @@ class OmrDispatcher:
         max_failovers: int = 2,
         max_attempts: int | None = None,
         replace: bool = False,
+        specialist_definition: SpecialistDefinition | dict[str, Any] | Path | str | None = None,
+        specialists_root: Path | str | None = None,
+        require_skill_evidence: bool = False,
     ) -> RoutingBackend:
         """Register a profile-free specialist over an existing runtime harness pool."""
         raw_targets = list(targets) if isinstance(targets, (list, tuple)) else [RouteTarget(name, name, targets)]
@@ -2338,6 +2511,10 @@ class OmrDispatcher:
                 route_targets.append(target)
         if not route_targets:
             raise ValueError("A dynamic specialist requires at least one harness target")
+        spec_def = SpecialistDefinition.from_obj(specialist_definition) if specialist_definition is not None else SpecialistDefinition(name=name)
+        if not spec_def.name:
+            spec_def = dataclass_replace(spec_def, name=name)
+        spec_def = SpecialistFolderManager.ensure_specialist_dir(spec_def, Path(specialists_root) if specialists_root is not None else getattr(self, "specialists_root", self.run_root.parent / "specialists"))
         existing = None
         getter = getattr(self.table, "backend", None)
         if callable(getter):
@@ -2348,6 +2525,10 @@ class OmrDispatcher:
             if isinstance(candidate, RoutingBackend):
                 existing = candidate
         if existing is not None and not replace:
+            if specialist_definition is not None:
+                existing.specialist_definition = spec_def
+            if require_skill_evidence:
+                existing.require_skill_evidence = True
             target_names = {target.name for target in existing._targets}
             for target in route_targets:
                 if target.name not in target_names:
@@ -2373,9 +2554,10 @@ class OmrDispatcher:
             instances=instances,
             max_failovers=max_failovers,
             max_attempts=max_attempts,
-            specialist_definition=SpecialistDefinition(name=name),
+            specialist_definition=spec_def,
             is_dynamic_specialist=True,
         )
+        routed.require_skill_evidence = bool(require_skill_evidence)
         table_backends = getattr(self.table, "_backends", None)
         if isinstance(table_backends, dict):
             table_backends[name] = routed
@@ -2898,8 +3080,10 @@ __all__ = [
     "SkillContractViolationError",
     "SkillPackInjector",
     "SkillPackResolver",
+    "SessionHarnessFlagBuilder",
     "SliceReceipt",
     "SpecialistDefinition",
+    "SpecialistFolderManager",
     "SpecialistPlaceholderBackend",
     "StaleReviewError",
     "WorktreeManager",
