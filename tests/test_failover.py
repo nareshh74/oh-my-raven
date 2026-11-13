@@ -43,6 +43,18 @@ def test_failover_to_next_harness_records_attempts():
     assert rb.last_attempts[0]["error_class"] == "TimeoutError"
 
 
+def test_routing_emits_opentelemetry_attempt_events(monkeypatch):
+    events = []
+    class Span:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def set_attribute(self, *args): pass
+        def add_event(self, name, attributes=None): events.append((name, attributes))
+    monkeypatch.setattr(mod._TRACER, "start_as_current_span", lambda name: Span())
+    assert run(mk(Fake("a"), max_attempts=1)) == "a ok"
+    assert events and events[0][0] == "omr.routing.attempt"
+
+
 def test_revival_retries_same_harness_bounded():
     a = Fake("a", fail=2, exc=ConnectionError)
     rb = mk(a, max_attempts=3)
