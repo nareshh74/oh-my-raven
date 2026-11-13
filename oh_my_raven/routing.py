@@ -351,7 +351,7 @@ class RoutingBackend(SubagentBackend):
         instances: Any,
         target_ready: TargetReady | None = None,
         max_failovers: int = 2,
-        max_attempts: int | None = DEFAULT_MAX_ATTEMPTS,
+        max_attempts: int | None = None,
         cooldown_s: float = 60.0,
         max_review_cycles: int = 3,
         clock: Callable[[], float] = time.monotonic,
@@ -377,7 +377,15 @@ class RoutingBackend(SubagentBackend):
         self._max_failovers = max(0, int(max_failovers))
         # Conductor revival: when set, the chain is cycled (dead implementors are
         # re-spawned) until exactly this many attempts have been made.
-        self._max_attempts = max(1, int(max_attempts)) if max_attempts is not None else None
+        # Precedence: an explicit ``max_attempts`` is an exact total-attempt cap
+        # (truncates or cycles the chain). When omitted, the cap is
+        # max(DEFAULT_MAX_ATTEMPTS, 1 + max_failovers), so a configured
+        # ``max_failovers`` is never truncated and short chains still revive.
+        self._max_attempts = (
+            max(1, int(max_attempts))
+            if max_attempts is not None
+            else max(DEFAULT_MAX_ATTEMPTS, 1 + self._max_failovers)
+        )
         self.last_attempts: list[dict[str, Any]] = []
         self._cooldown_s = float(cooldown_s)
         self.max_review_cycles = max(1, int(max_review_cycles))
@@ -1189,6 +1197,7 @@ class RoutingBackend(SubagentBackend):
 
 
 __all__ = [
+    "DEFAULT_MAX_ATTEMPTS",
     "HOST_PREFIX",
     "Picked",
     "RouteTarget",

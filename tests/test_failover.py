@@ -58,6 +58,15 @@ def test_default_max_attempts_is_active_by_default():
     assert a.calls == 3
 
 
+def test_max_failovers_above_two_not_truncated_by_default_max_attempts():
+    p = Fake("p", fail=9)
+    a, b, c = Fake("a", fail=9), Fake("b", fail=9), Fake("c", fail=9)
+    d = Fake("d")
+    rb = mk(p, [a, b, c, d], max_failovers=4)
+    assert run(rb) == "d ok"
+    assert len(rb.last_attempts) == 5
+
+
 def test_exhaustion_surfaces_attempt_log():
     a = Fake("a", fail=99)
     rb = mk(a, max_attempts=3)
