@@ -21,7 +21,7 @@ from loguru import logger
 from raven.agent.subagent.dag_graph import DagNodeSpec
 from raven.agent.subagent.prompt_errors import DagValidationError
 from raven.contracts.subagent_backend import SubagentBackend, SubagentNoAnswerError
-from .gate import LessonsStore, TriageDecision, classify_triage_tier, escalate_triage_tier, GatePolicy, has_verifiable_evidence
+from .gate import LessonsStore, TriageDecision, classify_triage_tier, escalate_triage_tier, evaluate_council_consensus, GatePolicy, has_verifiable_evidence
 
 BRAND_NAME = "oh-my-raven"
 
@@ -2300,6 +2300,18 @@ class OmrDispatcher:
 
     def record_lesson(self, trigger: str, rule: str, source_task_id: str) -> None:
         self.lessons_store.record_lesson(trigger, rule, source_task_id)
+
+    def run_council_consensus(self, task_id: str, votes: list[dict[str, Any]]) -> dict[str, Any]:
+        verdict = evaluate_council_consensus(votes)
+        payload = verdict.model_dump()
+        receipt_path = self.run_root / "council" / f"{task_id}.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(receipt_path, payload)
+        if verdict.merged_gaps:
+            self.decide_gate("plan_gap_fill", f"council_gaps:{task_id}:{len(verdict.merged_gaps)}")
+            for gap in verdict.merged_gaps:
+                self.lessons_store.record_lesson("council_gap", gap, task_id)
+        return payload
 
     def execute_external_action(self, gate: str, detail: str, action_fn: Callable[[], Any]) -> Any:
         self.require_gate(gate, detail)

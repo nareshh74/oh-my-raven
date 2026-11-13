@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from oh_my_raven.gate import LessonsStore, GatePolicy, classify_triage_tier, escalate_triage_tier
+from oh_my_raven.gate import CouncilVote, LessonsStore, GatePolicy, classify_triage_tier, escalate_triage_tier, evaluate_council_consensus
 from oh_my_raven.oh_my_raven import OmrDispatcher
 
 
@@ -170,3 +170,40 @@ def test_execute_external_action_blocks_before_side_effect():
     with pytest.raises(PermissionError):
         dispatcher.execute_external_action("push", "origin", lambda: called.append(True))
     assert called == []
+
+
+def test_council_consensus_requires_ratio_and_no_gaps(monkeypatch):
+    attributes = []
+    class Span:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def set_attribute(self, key, value): attributes.append((key, value))
+    monkeypatch.setattr("oh_my_raven.gate._TRACER.start_as_current_span", lambda name: Span())
+    verdict = evaluate_council_consensus([
+        CouncilVote(voter="cto", approved=True),
+        {"voter": "reviewer", "approved": True, "gaps": ["add rollback", "add rollback"]},
+        {"voter": "engineer-superpowers", "approved": False, "gaps": ["test failure"]},
+    ])
+    assert not verdict.consensus
+    assert verdict.merged_gaps == ["add rollback", "test failure"]
+    assert ("omr.council.approved_count", 2) in attributes
+    assert evaluate_council_consensus([
+        {"voter": "cto", "approved": True}, {"voter": "reviewer", "approved": True}
+    ]).consensus
+
+
+def test_dispatcher_council_persists_and_records_gaps(tmp_path):
+    dispatcher = object.__new__(OmrDispatcher)
+    dispatcher.run_root = tmp_path / "runs"
+    dispatcher.gate_policy = GatePolicy()
+    dispatcher.gate_log_path = dispatcher.run_root / "gate_log.json"
+    dispatcher.lessons_store = LessonsStore(tmp_path / "history" / "lessons.jsonl")
+    result = dispatcher.run_council_consensus("task-1", [
+        {"voter": "cto", "approved": True, "gaps": ["prove rollback"]},
+        {"voter": "reviewer", "approved": True, "gaps": ["prove rollback"]},
+    ])
+    assert result["consensus"] is False
+    assert json.loads((dispatcher.run_root / "council" / "task-1.json").read_text()) == result
+    assert json.loads((dispatcher.run_root / "gate_log.json").read_text())[0]["detail"] == "council_gaps:task-1:1"
+    lesson = json.loads(dispatcher.lessons_store.path.read_text().splitlines()[0])
+    assert lesson == {"trigger": "council_gap", "rule": "prove rollback", "source_task_id": "task-1", "active": True}
