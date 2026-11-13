@@ -67,3 +67,46 @@ def test_persist_log_atomic_replace_and_corrupt_existing_recovery(tmp_path, monk
         {"gate": "technical_decision", "detail": "x"}
     ]
     assert list(tmp_path.glob("*.tmp")) == [] and list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_persist_log_read_oserror_propagates_without_overwriting(tmp_path, monkeypatch):
+    import os
+    from pathlib import Path
+
+    log_path = tmp_path / "gate_log.json"
+    original = [{"gate": "prior", "mode": "auto", "allowed": True, "reason": "ok"}]
+    log_path.write_text(json.dumps(original), encoding="utf-8")
+    real_read = Path.read_text
+
+    def fake_read(self, *a, **k):
+        if self == log_path:
+            raise PermissionError("locked")
+        return real_read(self, *a, **k)
+
+    replaced = []
+    monkeypatch.setattr(Path, "read_text", fake_read)
+    monkeypatch.setattr(os, "replace", lambda *a: replaced.append(a))
+    gp = GatePolicy()
+    gp.decide("technical_decision", "x")
+    with pytest.raises(PermissionError):
+        gp.persist_log(log_path)
+    assert replaced == []
+    monkeypatch.undo()
+    assert json.loads(log_path.read_text(encoding="utf-8")) == original
+
+
+def test_persist_log_replace_oserror_keeps_memory_log_and_no_tmp(tmp_path, monkeypatch):
+    import os
+
+    log_path = tmp_path / "gate_log.json"
+    gp = GatePolicy()
+    gp.decide("technical_decision", "x")
+
+    def boom(*a):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        gp.persist_log(log_path)
+    assert gp.log == [{"gate": "technical_decision", "detail": "x"}]
+    assert list(tmp_path.glob(".*.tmp")) == [] and not log_path.exists()

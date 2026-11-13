@@ -66,7 +66,7 @@ class GatePolicy:
         p = Path(path)
         try:
             existing = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
-        except (ValueError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError):
             existing = []
         if not isinstance(existing, list):
             existing = []
