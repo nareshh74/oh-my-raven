@@ -22,6 +22,7 @@ from raven.agent.subagent.dag_graph import DagNodeSpec
 from raven.agent.subagent.prompt_errors import DagValidationError
 from raven.contracts.subagent_backend import SubagentBackend, SubagentNoAnswerError
 from .gate import LessonsStore, TriageDecision, classify_triage_tier, escalate_triage_tier, evaluate_council_consensus, GatePolicy, has_verifiable_evidence
+from .routing import RouteTarget, RoutingBackend
 
 BRAND_NAME = "oh-my-raven"
 
@@ -2294,6 +2295,82 @@ class OmrDispatcher:
         self.gate_policy = GatePolicy.load_default(gate_policy_path)
         self.gate_log_path = self.run_root / "gate_log.json"
         self.lessons_store = LessonsStore(self.history_root / "lessons.jsonl")
+
+    def onboard_harness(
+        self,
+        name: str,
+        backend: Any,
+        weight: float = 1.0,
+        max_failovers: int | None = None,
+    ) -> int:
+        """Add a runtime harness to every routed specialist without profile setup."""
+        del weight  # Reserved for table implementations with weighted pools.
+        backends = getattr(self.table, "_backends", None) or getattr(self.table, "_b", {})
+        updated = 0
+        for routed in backends.values():
+            if not isinstance(routed, RoutingBackend):
+                continue
+            if any(target.name == name for target in routed._targets):
+                continue
+            routed._targets.append(RouteTarget(name, name, backend))
+            if max_failovers is not None:
+                routed._max_failovers = max(0, int(max_failovers))
+                routed._max_attempts = max(routed._max_attempts, 1 + routed._max_failovers)
+            updated += 1
+        self.decide_gate("technical_decision", f"onboard_harness:{name}")
+        return updated
+
+    def onboard_specialist(
+        self,
+        name: str,
+        targets: list[RouteTarget] | Any,
+        max_failovers: int = 2,
+        max_attempts: int | None = None,
+    ) -> RoutingBackend:
+        """Register a profile-free specialist over an existing runtime harness pool."""
+        route_targets = list(targets) if isinstance(targets, (list, tuple)) else [RouteTarget(name, name, targets)]
+        if not route_targets:
+            raise ValueError("A dynamic specialist requires at least one harness target")
+        instances = next(
+            (routed._instances for routed in getattr(self.table, "_backends", {}).values() if isinstance(routed, RoutingBackend)),
+            None,
+        )
+        if instances is None:
+            instances = next(
+                (routed._instances for routed in getattr(self.table, "_b", {}).values() if isinstance(routed, RoutingBackend)),
+                None,
+            )
+        if instances is None:
+            instances = type("_RuntimeInstances", (), {"list_instances": lambda self, kind=None: []})()
+        routed = RoutingBackend(
+            name,
+            SpecialistPlaceholderBackend(name),
+            route_targets,
+            instances=instances,
+            max_failovers=max_failovers,
+            max_attempts=max_attempts,
+            specialist_definition=SpecialistDefinition(name=name),
+            is_dynamic_specialist=True,
+        )
+        table_backends = getattr(self.table, "_backends", None)
+        if isinstance(table_backends, dict):
+            table_backends[name] = routed
+            rows = getattr(self.table, "_rows", None)
+            order = getattr(self.table, "_order", None)
+            if isinstance(rows, dict):
+                rows[name] = type("DynamicSpecialistRow", (), {
+                    "name": name, "description": name, "kind": "specialist", "enabled": True,
+                    "hidden": False, "is_harness": False,
+                })()
+                if isinstance(order, list) and name not in order:
+                    order.append(name)
+        else:
+            simple_backends = getattr(self.table, "_b", None)
+            if not isinstance(simple_backends, dict):
+                raise TypeError("table does not support runtime registration")
+            simple_backends[name] = routed
+        self.decide_gate("technical_decision", f"onboard_specialist:{name}")
+        return routed
 
     def triage_task(self, prompt: str, file_count_hint: int | None = None) -> TriageDecision:
         return classify_triage_tier(prompt, file_count_hint)
