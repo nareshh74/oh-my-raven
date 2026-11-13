@@ -17,7 +17,8 @@ from typing import Any
 
 import pytest
 
-from oh_my_raven.oh_my_raven import OmrDispatcher, OmrTaskQueue, WorktreeManager
+from oh_my_raven.oh_my_raven import DynamicDecompositionGate, OmrDispatcher, OmrTaskQueue, WorktreeManager, escalate_triage_tier
+from raven.agent.subagent.prompt_errors import DagValidationError
 from oh_my_raven.routing import DEFAULT_MAX_ATTEMPTS, RouteTarget, RoutingBackend
 
 PASSING_TEST = "def test_ok():\n    assert True\n"
@@ -263,7 +264,7 @@ class _SubprocessHarness:
         if proc.returncode != 0:
             raise ConnectionError(f"harness crashed rc={proc.returncode}")
         _git(self.wt, "add", "-A")
-        _git(self.wt, "commit", "-q", "-m", "worker output")
+        _git(self.wt, "commit", "--allow-empty", "-q", "-m", "worker output")
         return json.dumps({"evidence": {"receipt_path": "receipt.json"}})
 
 
@@ -318,6 +319,35 @@ class TestOutsideInScope:
         assert json.loads(d.gate_log_path.read_text())[0]["gate"] == "technical_decision"
         assert not list(d.gate_log_path.parent.glob(".gate_log.json.*.tmp"))
 
+    def test_outside_in_hot_onboard_new_specialist_and_new_harness_zero_profile_setup(self, tmp_path):
+        repo = _init_repo(tmp_path)
+        base = _git(repo, "rev-parse", "HEAD")
+        wt = WorktreeManager().provision_worktree(repo, tmp_path / "wts", "hot", "n1", base)
+        _git(wt, "config", "user.email", "t@example.com")
+        _git(wt, "config", "user.name", "t")
+        dead = _Flaky("existing", 99, wt)
+        table = _Table({"Manager": _routing("Manager", dead, max_failovers=1)})
+        dispatcher = _dispatcher(tmp_path, wt, table)
+        windsurf_harness = _SubprocessHarness(wt, fail_first=0)
+
+        assert dispatcher.onboard_harness("Windsurf-ACP", windsurf_harness, max_failovers=1) == 1
+        existing = asyncio.run(dispatcher.dispatch_specialist_node("HOT-H", "Manager", "fail over", writes=True))
+        assert table.backend("Manager").last_chosen_backend == "Windsurf-ACP"
+        assert dispatcher.completion_status(existing) == "completed"
+
+        security = dispatcher.onboard_specialist(
+            "Security-Auditor", [RouteTarget("Windsurf-ACP", "runtime harness", windsurf_harness)]
+        )
+        result = asyncio.run(dispatcher.dispatch_specialist_node("HOT-S", "Security-Auditor", "audit", writes=True))
+        assert security.last_chosen_backend == "Windsurf-ACP"
+        assert dispatcher.completion_status(result) == "completed"
+        assert dispatcher.queue.latest_by_task()["HOT-S"].status == "completed"
+        assert not (tmp_path / "profiles" / "Security-Auditor").exists()
+        assert {row["status"] for row in _ledger(tmp_path) if row["task_id"] == "HOT-S"} >= {"routed", "running", "completed"}
+        details = [row["detail"] for row in json.loads(dispatcher.gate_log_path.read_text())]
+        assert "onboard_harness:Windsurf-ACP" in details
+        assert "onboard_specialist:Security-Auditor" in details
+
     def test_outside_in_policy_dial_modes_via_env_and_json_file(self, tmp_path, monkeypatch):
         policy = tmp_path / "gate_policy.json"
         monkeypatch.setenv("OMR_GATE_POLICY_PATH", str(policy))
@@ -356,12 +386,28 @@ class _Flaky:
 
 
 class TestEndToEndGoldenSet:
-    def test_e2e_golden_set_5_scenarios_across_trust_symptoms(self, tmp_path):
+    def test_e2e_golden_set_all_10_trust_symptoms(self, tmp_path):
         scores: dict[str, bool] = {}
 
-        # Scenario 1 (symptom #3): premature "done" rejected.
-        d1 = _submit(tmp_path / "s1", lambda repo: "All done!")
-        scores["s1"] = d1.queue.latest_by_task()["PARENT"].status == "incomplete"
+        # 1: trivial work takes the one-node fast path without CTO/Manager DAG ceremony.
+        repo1 = _init_repo(tmp_path / "s1")
+        fast = _Worker(repo1, _write_deliverable)
+        d1 = _dispatcher(tmp_path / "s1", repo1, _Table({"Worker": _routing("Worker", fast)}))
+        asyncio.run(d1.submit_trivial_task("T1", "fix typo in config.yaml", "Worker"))
+        scores["s1"] = d1.triage_task("fix typo in config.yaml", 1).tier == "trivial" and fast.output is _write_deliverable
+
+        # 2: council disagreement exposes and persists plan gaps.
+        council = d1.run_council_consensus("C1", [
+            {"voter": "cto", "approved": True},
+            {"voter": "reviewer", "approved": True, "gaps": ["rollback missing"]},
+            {"voter": "engineer-superpowers", "approved": False, "gaps": ["test gap"]},
+        ])
+        scores["s2"] = (not council["consensus"] and council["merged_gaps"] == ["rollback missing", "test gap"]
+                        and (tmp_path / "s1" / "history" / "lessons.jsonl").is_file())
+
+        # 3: premature "done" rejected.
+        d3 = _submit(tmp_path / "s3", lambda repo: "All done!")
+        scores["s3"] = d3.queue.latest_by_task()["PARENT"].status == "incomplete"
 
         # Scenario 2 (symptoms #3, #4): real deliverable verified by a real pytest run.
         def s2(repo: Path) -> str:
@@ -371,41 +417,70 @@ class TestEndToEndGoldenSet:
             (repo / "tests" / "test_feature_e2e.py").write_text(PASSING_TEST)
             return json.dumps({"evidence": {"test_command": "pytest tests/test_feature_e2e.py", "exit_code": 0}})
 
-        repo2 = _init_repo(tmp_path / "s2")
-        d2 = _dispatcher(tmp_path / "s2", repo2, _Table({"Worker": _routing("Worker", _Worker(repo2, s2))}))
-        out2 = asyncio.run(d2.dispatch_specialist_node("T2", "Worker", "build feature", writes=True))
-        scores["s2"] = (d2.completion_status(out2) == "completed"
-                        and d2.queue.latest_by_task()["T2"].status == "completed")
+        repo4 = _init_repo(tmp_path / "s4")
+        d4 = _dispatcher(tmp_path / "s4", repo4, _Table({"Worker": _routing("Worker", _Worker(repo4, s2))}))
+        out4 = asyncio.run(d4.dispatch_specialist_node("T4", "Worker", "build feature", writes=True))
+        scores["s4"] = d4.completion_status(out4) == "completed" and d4.queue.latest_by_task()["T4"].status == "completed"
 
         # Scenario 3 (symptom #5): routine decisions auto-logged, push blocked.
-        repo3 = _init_repo(tmp_path / "s3")
-        d3 = _dispatcher(tmp_path / "s3", repo3, _Table({}))
-        proceed = d3.decide_gate("technical_decision", "pick stdlib") and d3.decide_gate("plan_gap_fill", "fill")
-        logged = [e["gate"] for e in json.loads(d3.gate_log_path.read_text())]
+        repo5 = _init_repo(tmp_path / "s5")
+        d5 = _dispatcher(tmp_path / "s5", repo5, _Table({}))
+        answer = d5.run_ambiguity_experiment("A", "which local config?", lambda: {"resolved": True})
         try:
-            d3.require_gate("push", "origin/main")
+            d5.require_gate("push", "origin/main")
             blocked = False
         except PermissionError:
             blocked = True
-        scores["s3"] = bool(proceed) and logged == ["technical_decision", "plan_gap_fill"] and blocked
+        scores["s5"] = answer["proceed"] and answer["resolved_by"] == "experiment" and blocked
+
+        # 6: intake selects security, architecture, and implementation specialists.
+        names = {"security": "Security-Auditor", "architecture": "CTO", "implementation": "Engineer"}
+        rows = [SimpleNamespace(name=n, description=n, is_harness=False, kind="specialist") for n in names.values()]
+        table6 = _Table({})
+        table6.enabled = lambda: rows
+        d6 = _dispatcher(tmp_path / "s6", repo5, table6)
+        d6.intake_router = lambda menu, prompt, default: names[prompt]
+        routed = [asyncio.run(d6.route_intake_specialist(prompt)) for prompt in names]
+        scores["s6"] = routed == list(names.values())
+
+        # 7: governance gate rejects a multi-requirement DAG missing CTO/reviewer coverage.
+        bad = {"task_summary": "missing specialists", "nodes": [
+            {"id": "work", "subagent": "Engineer", "node_summary": "work", "prompt_template": "work", "execution_kind": "read"}
+        ]}
+        with pytest.raises(DagValidationError):
+            DynamicDecompositionGate.validate_and_enqueue(bad, OmrTaskQueue(tmp_path / "s7.jsonl"), "S7")
+        scores["s7"] = True
 
         # Scenario 4 (symptom #8): two crashes, revived on attempt 3.
-        repo4 = _init_repo(tmp_path / "s4")
-        primary = _Flaky("p", 2, repo4)
+        repo8 = _init_repo(tmp_path / "s8")
+        primary = _Flaky("p", 2, repo8)
         rb4 = _routing("Worker", primary)
-        d4 = _dispatcher(tmp_path / "s4", repo4, _Table({"Worker": rb4}))
-        out4 = asyncio.run(d4.dispatch_specialist_node("T4", "Worker", "go"))
-        scores["s4"] = (primary.calls == 3 and len(rb4.last_attempts) == 3
-                        and d4.completion_status(out4) == "completed"
-                        and d4.queue.latest_by_task()["T4"].status == "completed")
+        d8 = _dispatcher(tmp_path / "s8", repo8, _Table({"Worker": rb4}))
+        out8a = asyncio.run(d8.dispatch_specialist_node("T8A", "Worker", "go"))
 
         # Scenario 5 (symptom #8): primary + 3 fallbacks fail, 4th fallback succeeds on attempt 5.
-        repo5 = _init_repo(tmp_path / "s5")
-        fbs = [_Flaky("a", 99, repo5), _Flaky("b", 99, repo5), _Flaky("c", 99, repo5), _Flaky("d", 0, repo5)]
-        rb5 = _routing("Worker", _Flaky("p", 99, repo5), fbs, max_failovers=4)
-        d5 = _dispatcher(tmp_path / "s5", repo5, _Table({"Worker": rb5}))
-        out5 = asyncio.run(d5.dispatch_specialist_node("T5", "Worker", "go"))
-        scores["s5"] = (len(rb5.last_attempts) == 5 and rb5.last_attempts[-1]["status"] == "succeeded"
-                        and d5.completion_status(out5) == "completed")
+        fbs = [_Flaky("a", 99, repo8), _Flaky("b", 99, repo8), _Flaky("c", 99, repo8), _Flaky("d", 0, repo8)]
+        rb8 = _routing("Fallback", _Flaky("p2", 99, repo8), fbs, max_failovers=4)
+        d8.table._b["Fallback"] = rb8
+        out8b = asyncio.run(d8.dispatch_specialist_node("T8B", "Fallback", "go"))
+        scores["s8"] = (primary.calls == DEFAULT_MAX_ATTEMPTS and d8.completion_status(out8a) == "completed"
+                        and len(rb8.last_attempts) == 5 and d8.completion_status(out8b) == "completed")
 
-        assert scores == {k: True for k in ("s1", "s2", "s3", "s4", "s5")}
+        # 9: rigor matches complexity; failed trivial work auto-escalates to a standard DAG.
+        scores["s9"] = (d1.triage_task("fix typo", 1).tier == "trivial"
+                        and escalate_triage_tier("trivial", "incomplete").tier == "standard")
+
+        # 10: first failure becomes an active lesson injected into the next prompt.
+        class Learner:
+            name, kind, streams = "Learner", "acp", False
+            def __init__(self): self.calls, self.prompts = 0, []
+            async def run(self, task, **kw):
+                self.calls += 1; self.prompts.append(task)
+                return "incomplete" if self.calls == 1 else _write_deliverable(repo8)
+        learner = Learner()
+        d10 = _dispatcher(tmp_path / "s10", repo8, _Table({"Learner": _routing("Learner", learner)}))
+        asyncio.run(d10.dispatch_specialist_node("L1", "Learner", "repeatable task"))
+        asyncio.run(d10.dispatch_specialist_node("L2", "Learner", "repeatable task"))
+        scores["s10"] = "[Active Lessons]" in learner.prompts[1]
+
+        assert scores == {f"s{i}": True for i in range(1, 11)}
