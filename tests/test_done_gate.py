@@ -17,9 +17,18 @@ def dispatcher(tmp_path, policy=None):
     )
 
 
+def _ok_test(path):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+
+
+GOOD = {"command": "pytest test_ok.py", "exit_code": 0}
+
+
 def test_done_requires_successful_test_evidence(tmp_path):
+    _ok_test(tmp_path)
     d = dispatcher(tmp_path)
-    assert d.completion_status(json.dumps({"evidence": {"test_command": 'python -c "assert True"', "exit_code": 0}})) == "completed"
+    assert d.completion_status(json.dumps({"evidence": {"test_command": "pytest test_ok.py", "exit_code": 0}})) == "completed"
     assert d.completion_status("done") == "incomplete"
     assert d.completion_status(json.dumps({"test_command": "pytest", "exit_code": 1})) == "incomplete"
 
@@ -75,7 +84,8 @@ def test_single_task_without_evidence_is_incomplete(tmp_path, monkeypatch):
 
     monkeypatch.setattr(m.SkillAndToolReceiptGate, "verify_specialist_execution", staticmethod(lambda *a, **k: None))
     assert _run_node(tmp_path, "done") == "incomplete"
-    good = json.dumps({"evidence": {"command": 'python -c "assert True"', "exit_code": 0}})
+    _ok_test(tmp_path / "g")
+    good = json.dumps({"evidence": GOOD})
     assert _run_node(tmp_path / "g", good) == "completed"
 
 
@@ -119,17 +129,15 @@ def _submit_with_output(tmp_path, monkeypatch, output):
 def test_dag_rollup_without_evidence_is_incomplete(tmp_path, monkeypatch):
     d = _submit_with_output(tmp_path / "bad", monkeypatch, "done")
     assert d.queue.latest_by_task()["parent"].status == "incomplete"
-    evidence = json.dumps({"evidence": {"command": 'python -c "assert True"', "exit_code": 0}})
+    _ok_test(tmp_path / "good")
+    evidence = json.dumps({"evidence": GOOD})
     d = _submit_with_output(tmp_path / "good", monkeypatch, evidence)
     assert d.queue.latest_by_task()["parent"].status == "completed"
 
 
 def test_submit_task_consults_gate_policy_and_require_gate_blocks_irreversible(tmp_path, monkeypatch):
-    d = _submit_with_output(
-        tmp_path,
-        monkeypatch,
-        json.dumps({"evidence": {"command": 'python -c "assert True"', "exit_code": 0}}),
-    )
+    _ok_test(tmp_path)
+    d = _submit_with_output(tmp_path, monkeypatch, json.dumps({"evidence": GOOD}))
     gates = [entry["gate"] for entry in json.loads(d.gate_log_path.read_text())]
     assert gates == ["specialist_fallback", "technical_decision"]
     with pytest.raises(PermissionError, match="requires human approval"):
@@ -138,6 +146,7 @@ def test_submit_task_consults_gate_policy_and_require_gate_blocks_irreversible(t
 
 @pytest.mark.parametrize("command", [
     "pytest test_missing_file.py",
+    "pytest test_missing.py",
     'python -c "import sys; sys.exit(1)"',
     "nonexistent_binary_xyz",
 ])
@@ -145,3 +154,18 @@ def test_fabricated_failing_or_nonexistent_command_claim_is_rejected(tmp_path, c
     d = dispatcher(tmp_path)
     claim = json.dumps({"evidence": {"command": command, "exit_code": 0}})
     assert d.completion_status(claim) == "incomplete"
+
+
+def test_side_effecting_worker_command_rejected_and_never_invoked(tmp_path):
+    d = dispatcher(tmp_path)
+    for ev in (
+        {"command": "python -c \"import pathlib; pathlib.Path('pwned.txt').write_text('boom')\"", "exit_code": 0},
+        {"test_command": "pytest -p evil_plugin", "exit_code": 0},
+    ):
+        assert d.completion_status(json.dumps({"evidence": ev})) == "incomplete"
+    assert not (tmp_path / "pwned.txt").exists()
+
+
+def test_malformed_artifact_path_is_incomplete(tmp_path):
+    d = dispatcher(tmp_path)
+    assert d.completion_status(json.dumps({"artifact_path": "bad\x00path.txt"})) == "incomplete"

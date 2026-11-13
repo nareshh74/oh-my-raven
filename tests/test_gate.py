@@ -35,3 +35,12 @@ def test_persist_log_preserves_entries_from_prior_policy(tmp_path):
     second.decide("plan_gap", "second")
     second.persist_log(path)
     assert [entry["detail"] for entry in json.loads(path.read_text())] == ["first", "second"]
+
+
+def test_malformed_string_irreversible_auto_does_not_enable_auto(tmp_path):
+    f = tmp_path / "g.json"
+    f.write_text(json.dumps({"modes": {"push": "auto"}, "allow_irreversible_auto": "false"}))
+    assert not GatePolicy.load(f).decide("push")
+    p = GatePolicy(allow_irreversible_auto="false")
+    p.modes["push"] = "auto"
+    assert not p.decide("push")

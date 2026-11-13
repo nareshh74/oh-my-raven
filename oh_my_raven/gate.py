@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,7 +38,7 @@ class GatePolicy:
     def load(cls, path: str | Path) -> "GatePolicy":
         p = Path(path)
         data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-        pol = cls(allow_irreversible_auto=bool(data.get("allow_irreversible_auto", False)))
+        pol = cls(allow_irreversible_auto=data.get("allow_irreversible_auto") is True)
         for gate, mode in data.get("modes", {}).items():
             if mode not in MODES:
                 raise ValueError(f"invalid mode {mode!r} for gate {gate!r}")
@@ -45,7 +47,7 @@ class GatePolicy:
 
     def mode(self, gate: str) -> str:
         m = self.modes.get(gate, "ask")  # unknown gates are conservative
-        if gate in IRREVERSIBLE and m != "ask" and not self.allow_irreversible_auto:
+        if gate in IRREVERSIBLE and m != "ask" and self.allow_irreversible_auto is not True:
             return "ask"
         return m
 
@@ -68,6 +70,9 @@ class GatePolicy:
         p.write_text(json.dumps(existing + self.log, indent=2) + "\n", encoding="utf-8")
         self.log.clear()
 
+_TEST_PATH_RE = re.compile(r"^tests?/[A-Za-z0-9_./-]+$")
+_TEST_FILE_RE = re.compile(r"^test_[A-Za-z0-9_.-]+\.py$")
+
 
 def has_verifiable_evidence(result: str, repo_root: str | Path) -> bool:
     """Accept a successful command receipt or an existing artifact."""
@@ -80,16 +85,23 @@ def has_verifiable_evidence(result: str, repo_root: str | Path) -> bool:
     evidence = data.get("evidence", data)
     if not isinstance(evidence, dict):
         return False
-    root = Path(repo_root).resolve()
+    try:
+        root = Path(repo_root).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
 
     def confined_file(value: object) -> Path | None:
         if not isinstance(value, str) or not value.strip():
             return None
-        path = Path(value)
-        if path.is_absolute():
+        try:
+            path = Path(value)
+            if path.is_absolute():
+                return None
+            candidate = (root / path).resolve()
+            ok = candidate.is_relative_to(root) and candidate.is_file() and candidate.stat().st_size > 0
+        except (OSError, RuntimeError, ValueError):
             return None
-        candidate = (root / path).resolve()
-        return candidate if candidate.is_relative_to(root) and candidate.is_file() and candidate.stat().st_size > 0 else None
+        return candidate if ok else None
 
     receipt = confined_file(evidence.get("receipt_path"))
     artifact = confined_file(evidence.get("artifact_path"))
@@ -108,13 +120,27 @@ def has_verifiable_evidence(result: str, repo_root: str | Path) -> bool:
     exit_code = evidence.get("exit_code")
     if not isinstance(command, str) or not command.strip() or isinstance(exit_code, bool) or exit_code != 0:
         return False
+    # Never run worker-supplied programs: only a strict pytest allowlist.
     try:
-        args = shlex.split(command)
-        if args and args[0].lower() in {"pytest", "pytest.exe"}:
-            args = [sys.executable, "-m", "pytest", *args[1:]]
-        elif args and args[0].lower() in {"python", "python.exe"}:
-            args[0] = sys.executable
-        proc = subprocess.run(args, cwd=str(root), capture_output=True, text=True, timeout=15, check=False)
+        parts = shlex.split(command.strip())
+    except ValueError:
+        return False
+    if not parts or parts[0] != "pytest":
+        return False
+    safe_args: list[str] = []
+    for arg in parts[1:]:
+        if arg in ("-q", "-v"):
+            continue
+        if arg.startswith("-") or not (_TEST_PATH_RE.match(arg) or _TEST_FILE_RE.match(arg)):
+            return False
+        if confined_file(arg) is None:
+            return False
+        safe_args.append(arg)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", *safe_args],
+            cwd=str(root), shell=False, capture_output=True, text=True, timeout=15, check=False,
+        )
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return False
     return proc.returncode == 0
