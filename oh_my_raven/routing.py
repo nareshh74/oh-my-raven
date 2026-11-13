@@ -1162,7 +1162,19 @@ class RoutingBackend(SubagentBackend):
             self._dispatch_counts[candidate.name] = int(self._dispatch_counts.get(candidate.name, 0)) + 1
             try:
                 for attr in ("last_skill_evidence", "last_invoked_tools", "last_invoked_mcps"):
-                    if hasattr(self, attr): delattr(self, attr)
+                    if hasattr(self, attr):
+                        try:
+                            delattr(self, attr)
+                        except AttributeError:
+                            pass
+                    if hasattr(candidate.backend, attr):
+                        try:
+                            delattr(candidate.backend, attr)
+                        except (AttributeError, TypeError):
+                            try:
+                                setattr(candidate.backend, attr, None)
+                            except (AttributeError, TypeError):
+                                pass
                 result = await candidate.backend.run(
                     attempt_task,
                     task_id=task_id,
