@@ -842,6 +842,12 @@ class RoutingBackend(SubagentBackend):
         mcp_servers_attached: Sequence[str] = (),
         context_charter_injected: bool = False,
         cto_brief_injected: bool = False,
+        specialist_dir: str = "",
+        agents_md_path: str = "",
+        session_cli_args: Sequence[str] = (),
+        mcps_enabled: Sequence[str] = (),
+        mcps_disabled: Sequence[str] = (),
+        plugins_enabled: Sequence[str] = (),
     ) -> None:
         tpath = self._resolve_telemetry_path(session_key)
         if tpath is None:
@@ -864,6 +870,12 @@ class RoutingBackend(SubagentBackend):
             "mcp_servers_attached": [str(m) for m in mcp_servers_attached if str(m)],
             "context_charter_injected": bool(context_charter_injected),
             "cto_brief_injected": bool(cto_brief_injected),
+            "specialist_dir": specialist_dir,
+            "agents_md_path": agents_md_path,
+            "session_cli_args": list(session_cli_args),
+            "mcps_enabled": list(mcps_enabled),
+            "mcps_disabled": list(mcps_disabled),
+            "plugins_enabled": list(plugins_enabled),
         }
         TelemetryLogger(tpath).write_record(record)
 
@@ -918,6 +930,7 @@ class RoutingBackend(SubagentBackend):
             from raven.agent.subagent.oh_my_raven import SkillPackResolver, SpecialistDefinition
 
             spec_def = SpecialistDefinition.from_obj(self.specialist_definition)
+            self._active_spec_def = spec_def
             if spec_def.has_specialist_bundle:
                 base_task = SkillPackResolver.render_specialist_bundle(spec_def, base_task)
                 skill_packs_injected = tuple(spec_def.skill_packs)
@@ -1025,9 +1038,11 @@ class RoutingBackend(SubagentBackend):
     ) -> None:
         duration_ms = round(max(0.0, (self._clock() - attempt_start) * 1000.0), 3)
         error_class = type(exc).__name__
+        session_attempt = getattr(self, "last_session_flags", {})
+        session_fields = ({"harness_family": session_attempt.get("harness_family", ""), "specialist_dir": session_attempt.get("specialist_dir", "")} if session_attempt else {})
         if isinstance(exc, _NON_RETRYABLE_ERRORS) or not isinstance(exc, _RETRYABLE_ERRORS):
             attempt_records.append(
-                {"backend": candidate.name, "status": "aborted", "error_class": error_class, "duration_ms": duration_ms}
+                {"backend": candidate.name, "status": "aborted", "error_class": error_class, "duration_ms": duration_ms, **session_fields}
             )
             self._emit_telemetry(
                 session_key=session_key,
@@ -1061,7 +1076,7 @@ class RoutingBackend(SubagentBackend):
                 exc=exc,
             )
         attempt_records.append(
-            {"backend": candidate.name, "status": "failed", "error_class": error_class, "duration_ms": duration_ms}
+            {"backend": candidate.name, "status": "failed", "error_class": error_class, "duration_ms": duration_ms, **session_fields}
         )
         self._record_cooldown(candidate.name)
         await self._unbind_failed_instance(session_key, candidate.name, instance)
@@ -1124,6 +1139,18 @@ class RoutingBackend(SubagentBackend):
         }
 
         for idx, candidate in enumerate(chain):
+            session_bundle: dict[str, Any] = {}
+            if self.specialist_definition is not None:
+                from raven.agent.subagent.oh_my_raven import SessionHarnessFlagBuilder
+                session_bundle = SessionHarnessFlagBuilder.build_for_candidate(self.specialist_definition, candidate.name, backend=candidate.backend)
+                spec = getattr(self, "_active_spec_def", None)
+                if spec and (spec.specialist_dir or spec.agents_md_path or spec.skill_packs or spec.mcp_servers or spec.disabled_mcp_servers or spec.plugins):
+                    self.last_session_flags = session_bundle
+            telemetry_extra.update({k: session_bundle.get(k, ()) for k in ("specialist_dir", "agents_md_path", "session_cli_args", "mcps_enabled", "mcps_disabled", "plugins_enabled")})
+            session_kwargs: dict[str, Any] = {}
+            for key in ("specialist_dir", "agents_md_path", "session_cli_args", "session_mcp_config"):
+                if session_bundle.get(key):
+                    session_kwargs.update(optional_keyword(candidate.backend, key, session_bundle[key]))
             attempt_task = f"{base_task}{candidate.note}" if candidate.note else base_task
             attempt_authored = (
                 f"{base_authored_task}{candidate.note}"
@@ -1134,6 +1161,8 @@ class RoutingBackend(SubagentBackend):
             self._inflight_counts[candidate.name] = int(self._inflight_counts.get(candidate.name, 0)) + 1
             self._dispatch_counts[candidate.name] = int(self._dispatch_counts.get(candidate.name, 0)) + 1
             try:
+                for attr in ("last_skill_evidence", "last_invoked_tools", "last_invoked_mcps"):
+                    if hasattr(self, attr): delattr(self, attr)
                 result = await candidate.backend.run(
                     attempt_task,
                     task_id=task_id,
@@ -1142,13 +1171,16 @@ class RoutingBackend(SubagentBackend):
                     session_key=session_key,
                     instance=instance,
                     **optional_keyword(candidate.backend, "authored_task", attempt_authored),
+                    **session_kwargs,
                     **call_kwargs,
                 )
                 self._forward_candidate_attributes(candidate.name, candidate.backend)
+                require_ev = bool(call_kwargs.get("require_skill_evidence", False) or getattr(self, "require_skill_evidence", False) or getattr(candidate.backend, "require_skill_evidence", False))
+                if require_ev or call_kwargs.get("required_skill_packs") or call_kwargs.get("required_tools") or call_kwargs.get("required_mcps"):
+                    from raven.agent.subagent.oh_my_raven import SkillAndToolReceiptGate
+                    SkillAndToolReceiptGate.verify_specialist_execution(self, candidate.backend, result, delivered_prompt=attempt_task, require_skill_evidence=require_ev, required_skill_packs=call_kwargs.get("required_skill_packs") or (), required_tools=call_kwargs.get("required_tools") or (), required_mcps=call_kwargs.get("required_mcps") or ())
                 duration_ms = round(max(0.0, (self._clock() - attempt_start) * 1000.0), 3)
-                attempt_records.append(
-                    {"backend": candidate.name, "status": "succeeded", "error_class": None, "duration_ms": duration_ms}
-                )
+                attempt_records.append({"backend": candidate.name, "status": "succeeded", "error_class": None, "duration_ms": duration_ms, **({"harness_family": session_bundle["harness_family"], "specialist_dir": session_bundle["specialist_dir"]} if session_bundle else {})})
                 self._emit_telemetry(
                     session_key=session_key,
                     task_id=task_id,
