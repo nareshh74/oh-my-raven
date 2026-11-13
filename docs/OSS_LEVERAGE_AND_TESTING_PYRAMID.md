@@ -35,3 +35,7 @@ Tests deliberately widen from deterministic functions to real process, filesyste
 | `tests/test_specialist_orchestration_e2e.py` | End-to-end | Real Git worktrees/merges, scope validation, recovery ledger, reviewer cycles, CTO strategy, RTM/AST gates | Conflicting edits, missing review, tunnel vision, lost recovery state, premature completion |
 
 Pyramid policy: unit tests give fast schema and decision feedback; integration tests join owned components; outside-in tests enter through public APIs with real boundary adapters; end-to-end tests prove repeatable user outcomes. A feature is not considered proven solely by unit coverage.
+
+## 3. Live Dogfood Experiment
+
+Beyond the test pyramid, `scripts/dogfood_omr_workload_experiment.py` runs six realistic workloads (trivial fast path, council review, ambiguity experiment, lessons loop, crash failover with hot-onboarded harness/specialist, blocked push) over a real git repo with OTel span capture. Measured results are in `docs/DOGFOOD_EXPERIMENT_REPORT.md`; regenerate with `python scripts/dogfood_omr_workload_experiment.py --write-report`. Guarded by `tests/test_dogfood_experiment.py`.
