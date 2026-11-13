@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -58,7 +61,12 @@ class GatePolicy:
         return cls.load(path or os.environ.get(DEFAULT_POLICY_ENV, "gate_policy.json"))
 
     def persist_log(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(self.log, indent=2) + "\n", encoding="utf-8")
+        p = Path(path)
+        existing = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+        if not isinstance(existing, list):
+            existing = []
+        p.write_text(json.dumps(existing + self.log, indent=2) + "\n", encoding="utf-8")
+        self.log.clear()
 
 
 def has_verifiable_evidence(result: str, repo_root: str | Path) -> bool:
@@ -72,16 +80,41 @@ def has_verifiable_evidence(result: str, repo_root: str | Path) -> bool:
     evidence = data.get("evidence", data)
     if not isinstance(evidence, dict):
         return False
+    root = Path(repo_root).resolve()
+
+    def confined_file(value: object) -> Path | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        path = Path(value)
+        if path.is_absolute():
+            return None
+        candidate = (root / path).resolve()
+        return candidate if candidate.is_relative_to(root) and candidate.is_file() and candidate.stat().st_size > 0 else None
+
+    receipt = confined_file(evidence.get("receipt_path"))
+    artifact = confined_file(evidence.get("artifact_path"))
+    if receipt:
+        try:
+            receipt_data = json.loads(receipt.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            receipt_data = None
+        if receipt.suffix.lower() == ".json":
+            return isinstance(receipt_data, dict) and receipt_data.get("verified") is True and receipt_data.get("exit_code") == 0
+        return True
+    if artifact:
+        return True
+
     command = evidence.get("test_command") or evidence.get("command")
     exit_code = evidence.get("exit_code")
-    if isinstance(command, str) and command.strip() and exit_code == 0:
-        return True
-    artifact = evidence.get("artifact_path")
-    if isinstance(artifact, str) and artifact.strip():
-        root = Path(repo_root).resolve()
-        path = Path(artifact)
-        if path.is_absolute():
-            return False
-        candidate = (root / path).resolve()
-        return candidate.is_relative_to(root) and candidate.exists()
-    return False
+    if not isinstance(command, str) or not command.strip() or isinstance(exit_code, bool) or exit_code != 0:
+        return False
+    try:
+        args = shlex.split(command)
+        if args and args[0].lower() in {"pytest", "pytest.exe"}:
+            args = [sys.executable, "-m", "pytest", *args[1:]]
+        elif args and args[0].lower() in {"python", "python.exe"}:
+            args[0] = sys.executable
+        proc = subprocess.run(args, cwd=str(root), capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
