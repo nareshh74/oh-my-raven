@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 import portalocker
 from opentelemetry import trace as otel_trace
+from pydantic import BaseModel, Field
 
 _TRACER = otel_trace.get_tracer("oh_my_raven")
 
@@ -32,6 +33,41 @@ DEFAULTS = {
     **{g: "ask" for g in IRREVERSIBLE},
 }
 DEFAULT_POLICY_ENV = "OMR_GATE_POLICY_PATH"
+
+
+class CouncilVote(BaseModel):
+    voter: str
+    approved: bool
+    gaps: list[str] = Field(default_factory=list)
+    confidence: float = 1.0
+
+
+class CouncilVerdict(BaseModel):
+    consensus: bool
+    votes: list[CouncilVote]
+    merged_gaps: list[str]
+    chair_summary: str
+
+
+def evaluate_council_consensus(
+    votes: list[CouncilVote | dict[str, Any]], min_approval_ratio: float = 0.67
+) -> CouncilVerdict:
+    parsed_votes = [CouncilVote.model_validate(vote) for vote in votes]
+    approved_count = sum(vote.approved for vote in parsed_votes)
+    merged_gaps = list(dict.fromkeys(gap for vote in parsed_votes for gap in vote.gaps))
+    approval_ratio = approved_count / len(parsed_votes) if parsed_votes else 0.0
+    consensus = approval_ratio >= min_approval_ratio and not merged_gaps
+    summary = (
+        f"Council {'approved' if consensus else 'blocked'}: "
+        f"{approved_count}/{len(parsed_votes)} approved, {len(merged_gaps)} gap(s)."
+    )
+    with _TRACER.start_as_current_span("omr.council.consensus") as span:
+        span.set_attribute("omr.council.voters", len(parsed_votes))
+        span.set_attribute("omr.council.approved_count", approved_count)
+        span.set_attribute("omr.council.consensus", consensus)
+    return CouncilVerdict(
+        consensus=consensus, votes=parsed_votes, merged_gaps=merged_gaps, chair_summary=summary
+    )
 
 
 @dataclass
