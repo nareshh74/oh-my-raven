@@ -64,10 +64,24 @@ class GatePolicy:
 
     def persist_log(self, path: str | Path) -> None:
         p = Path(path)
-        existing = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+        try:
+            existing = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+        except (ValueError, OSError):
+            existing = []
         if not isinstance(existing, list):
             existing = []
-        p.write_text(json.dumps(existing + self.log, indent=2) + "\n", encoding="utf-8")
+        payload = json.dumps(existing + self.log, indent=2) + "\n"
+        fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), prefix=f".{p.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+            os.replace(tmp_path, p)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         self.log.clear()
 
 _TEST_PATH_RE = re.compile(r"^tests?/[A-Za-z0-9_./-]+$")

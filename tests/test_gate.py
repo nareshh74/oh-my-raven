@@ -44,3 +44,26 @@ def test_malformed_string_irreversible_auto_does_not_enable_auto(tmp_path):
     p = GatePolicy(allow_irreversible_auto="false")
     p.modes["push"] = "auto"
     assert not p.decide("push")
+
+
+def test_persist_log_atomic_replace_and_corrupt_existing_recovery(tmp_path, monkeypatch):
+    import os
+
+    path = tmp_path / "gate_log.json"
+    path.write_text("{corrupt", encoding="utf-8")
+    calls = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        calls.append((str(src), str(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy)
+    pol = GatePolicy()
+    pol.decide("technical_decision", "x")
+    pol.persist_log(path)
+    assert len(calls) == 1 and calls[0][1] == str(path)
+    assert json.loads(path.read_text(encoding="utf-8")) == [
+        {"gate": "technical_decision", "detail": "x"}
+    ]
+    assert list(tmp_path.glob("*.tmp")) == [] and list(tmp_path.glob(".*.tmp")) == []
