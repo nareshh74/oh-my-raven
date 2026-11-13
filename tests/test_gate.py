@@ -207,3 +207,35 @@ def test_dispatcher_council_persists_and_records_gaps(tmp_path):
     assert json.loads((dispatcher.run_root / "gate_log.json").read_text())[0]["detail"] == "council_gaps:task-1:1"
     lesson = json.loads(dispatcher.lessons_store.path.read_text().splitlines()[0])
     assert lesson == {"trigger": "council_gap", "rule": "prove rollback", "source_task_id": "task-1", "active": True}
+
+
+def test_onboard_specialist_merges_via_public_table_backend_and_deduplicates_targets(tmp_path):
+    from types import SimpleNamespace
+    from oh_my_raven.oh_my_raven import OmrTaskQueue
+    from oh_my_raven.routing import RouteTarget, RoutingBackend
+
+    class Table:
+        def __init__(self):
+            self.registry = {}
+
+        def backend(self, name):
+            return self.registry[name]
+
+        def onboard(self, cfg, backend=None):
+            self.registry[cfg] = backend
+
+    table = Table()
+    d = OmrDispatcher(
+        table=table, queue=OmrTaskQueue(tmp_path / "q.jsonl"), workdir=tmp_path,
+        run_root=tmp_path / "runs", nodes_root=tmp_path / "nodes",
+        history_root=tmp_path / "history", gate_policy_path=None,
+    )
+    h1, h2 = SimpleNamespace(name="H1"), SimpleNamespace(name="H2")
+    rb = d.onboard_specialist("Sec-Audit", [RouteTarget("H1", "H1", h1), RouteTarget("H1", "H1", h1)])
+    assert isinstance(rb, RoutingBackend)
+    assert [t.name for t in rb._targets] == ["H1"]
+    merged = d.onboard_specialist(
+        "Sec-Audit", [RouteTarget("H1", "H1", h1), RouteTarget("H2", "H2", h2)], replace=False
+    )
+    assert merged is rb
+    assert [t.name for t in rb._targets] == ["H1", "H2"]

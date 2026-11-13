@@ -2329,7 +2329,13 @@ class OmrDispatcher:
         replace: bool = False,
     ) -> RoutingBackend:
         """Register a profile-free specialist over an existing runtime harness pool."""
-        route_targets = list(targets) if isinstance(targets, (list, tuple)) else [RouteTarget(name, name, targets)]
+        raw_targets = list(targets) if isinstance(targets, (list, tuple)) else [RouteTarget(name, name, targets)]
+        route_targets: list[RouteTarget] = []
+        seen_incoming: set[str] = set()
+        for target in raw_targets:
+            if target.name not in seen_incoming:
+                seen_incoming.add(target.name)
+                route_targets.append(target)
         if not route_targets:
             raise ValueError("A dynamic specialist requires at least one harness target")
         existing = None
@@ -2339,14 +2345,22 @@ class OmrDispatcher:
                 existing = registered[name]
                 break
         if existing is None:
-            getter = getattr(self.table, "get_backend", None)
-            if callable(getter):
-                candidate = getter(name)
-                if isinstance(candidate, RoutingBackend):
-                    existing = candidate
+            for method_name in ("backend", "get_backend"):
+                getter = getattr(self.table, method_name, None)
+                if callable(getter):
+                    try:
+                        candidate = getter(name)
+                    except (KeyError, ValueError, LookupError):
+                        candidate = None
+                    if isinstance(candidate, RoutingBackend):
+                        existing = candidate
+                        break
         if existing is not None and not replace:
             target_names = {target.name for target in existing._targets}
-            existing._targets.extend(target for target in route_targets if target.name not in target_names)
+            for target in route_targets:
+                if target.name not in target_names:
+                    target_names.add(target.name)
+                    existing._targets.append(target)
             self.decide_gate("technical_decision", f"onboard_specialist:{name}")
             return existing
         instances = next(
@@ -2384,9 +2398,12 @@ class OmrDispatcher:
                     order.append(name)
         else:
             simple_backends = getattr(self.table, "_b", None)
-            if not isinstance(simple_backends, dict):
+            if isinstance(simple_backends, dict):
+                simple_backends[name] = routed
+            elif callable(getattr(self.table, "onboard", None)):
+                self.table.onboard(name, backend=routed)
+            else:
                 raise TypeError("table does not support runtime registration")
-            simple_backends[name] = routed
         self.decide_gate("technical_decision", f"onboard_specialist:{name}")
         return routed
 
