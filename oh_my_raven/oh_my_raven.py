@@ -2299,11 +2299,18 @@ class OmrDispatcher:
         return "completed" if has_verifiable_evidence(result, self.workdir) else "incomplete"
 
     def decide_gate(self, gate: str, detail: str = "") -> bool:
+        """Record a gate decision; external/irreversible callers must use ``require_gate``."""
         proceed = self.gate_policy.decide(gate, detail)
         if self.gate_policy.log:
             self.gate_log_path.parent.mkdir(parents=True, exist_ok=True)
             self.gate_policy.persist_log(self.gate_log_path)
         return proceed
+
+    def require_gate(self, gate: str, detail: str = "") -> bool:
+        """Require approval before push, publish, deploy, spend, or delete_remote actions."""
+        if not self.decide_gate(gate, detail):
+            raise PermissionError(f"Gate {gate!r} requires human approval ({detail})")
+        return True
 
     async def route_intake_specialist(self, prompt: str, *, default: str = "Manager") -> str:
         menu = [(row.name, row.description) for row in self.table.enabled() if not row.is_harness or row.kind == "specialist"]
@@ -2315,6 +2322,7 @@ class OmrDispatcher:
                 ans = await ans
             if isinstance(ans, str) and any(name == ans for name, _ in menu):
                 return ans
+        self.decide_gate("specialist_fallback", f"default={default}")
         for name, _ in menu:
             if name.lower() == default.lower():
                 return name
@@ -2599,6 +2607,7 @@ class OmrDispatcher:
                 run_dir=run_dir,
                 workdir=self.workdir,
             )
+            self.decide_gate("technical_decision", f"decompose:{task_id}")
             self.queue.transition(
                 task_id,
                 "running",

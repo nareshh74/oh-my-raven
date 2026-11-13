@@ -78,8 +78,10 @@ def has_verifiable_evidence(result: str, repo_root: str | Path) -> bool:
         return True
     artifact = evidence.get("artifact_path")
     if isinstance(artifact, str) and artifact.strip():
-        candidate = Path(artifact)
-        if not candidate.is_absolute():
-            candidate = Path(repo_root) / candidate
-        return candidate.exists()
+        root = Path(repo_root).resolve()
+        path = Path(artifact)
+        if path.is_absolute():
+            return False
+        candidate = (root / path).resolve()
+        return candidate.is_relative_to(root) and candidate.exists()
     return False
