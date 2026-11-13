@@ -7,20 +7,21 @@ Span capture: owned recording tracer bound to oh_my_raven.gate/routing.
 
 | Workload | OK | Latency (ms) | Detail |
 |---|---|---|---|
-| W1_trivial_fast_path | True | 133.3 | tier=trivial, status=completed, specialist_turns=1 |
-| W2_council_plan_review | True | 91.26 | first_consensus=False, second_consensus=True, gaps=['missing edge-case test for empty input'] |
-| W3_ambiguity_experiment | True | 518.78 | proceed=True, resolved_by=experiment |
-| W4_premature_completion_lesson_loop | True | 28280.78 | first_status=incomplete, retry_status=completed, lessons_injected=True |
-| W5_crash_revival_failover_hot_onboard | True | 9009.61 | attempts=['failed', 'succeeded'], claude_calls=1, chosen_backend=Windsurf-ACP, committed=True, status=completed, onboard_logged=True |
-| W6_irreversible_action_blocked | True | 0.05 | blocked=True, callback_ran=False |
+| W1_trivial_fast_path | True | 82.06 | tier=trivial, status=completed, specialist_turns=1 |
+| W2_council_plan_review | True | 35.09 | first_consensus=False, second_consensus=True, gaps=['missing edge-case test for empty input'] |
+| W3_ambiguity_experiment | True | 172.14 | proceed=True, resolved_by=experiment |
+| W4_premature_completion_lesson_loop | True | 5742.7 | first_status=incomplete, retry_status=completed, lessons_injected=True |
+| W5_crash_revival_failover_hot_onboard | True | 1899.21 | attempts=['failed', 'succeeded'], claude_calls=1, chosen_backend=Windsurf-ACP, committed=True, status=completed, onboard_logged=True |
+| W6_irreversible_action_blocked | True | 0.04 | blocked=True, callback_ran=False |
+| W7_per_specialist_folder_agents_md_and_session_flag_failover | True | 1874.98 | specialist_dir_created=True, agents_md_loaded=True, first_attempt_error=SkillContractViolationError, chosen_backend=Codex-CLI, worktree_clean=True |
 
-All 6 workloads OK: **True**
+All 7 workloads OK: **True**
 
 ## Monitoring receipts
 
-- OTel spans captured: 11 (`{"omr.council.consensus": 2, "omr.gate.plan_gap_fill": 1, "omr.gate.push": 1, "omr.gate.technical_decision": 3, "omr.routing.run": 4}`)
-- `omr.routing.attempt` events: 5
-- `gate_log.json` entries: 4 (`{"plan_gap_fill": 1, "technical_decision": 3}`)
-- `queue_ledger.jsonl` rows: 16 (`{"enqueued": 4, "routed": 4, "running": 4, "completed": 3, "incomplete": 1}`)
+- OTel spans captured: 13 (`{"omr.council.consensus": 2, "omr.gate.plan_gap_fill": 1, "omr.gate.push": 1, "omr.gate.technical_decision": 4, "omr.routing.run": 5}`)
+- `omr.routing.attempt` events: 7
+- `gate_log.json` entries: 5 (`{"plan_gap_fill": 1, "technical_decision": 4}`)
+- `queue_ledger.jsonl` rows: 20 (`{"enqueued": 5, "routed": 5, "running": 5, "completed": 4, "incomplete": 1}`)
 - `specialist_telemetry.jsonl` rows: 3
-- `lessons.jsonl` rows: 3
+- `lessons.jsonl` rows: 2
