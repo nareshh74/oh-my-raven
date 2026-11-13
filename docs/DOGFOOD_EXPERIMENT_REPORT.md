@@ -7,13 +7,13 @@ Span capture: owned recording tracer bound to oh_my_raven.gate/routing.
 
 | Workload | OK | Latency (ms) | Detail |
 |---|---|---|---|
-| W1_trivial_fast_path | True | 82.06 | tier=trivial, status=completed, specialist_turns=1 |
-| W2_council_plan_review | True | 35.09 | first_consensus=False, second_consensus=True, gaps=['missing edge-case test for empty input'] |
-| W3_ambiguity_experiment | True | 172.14 | proceed=True, resolved_by=experiment |
-| W4_premature_completion_lesson_loop | True | 5742.7 | first_status=incomplete, retry_status=completed, lessons_injected=True |
-| W5_crash_revival_failover_hot_onboard | True | 1899.21 | attempts=['failed', 'succeeded'], claude_calls=1, chosen_backend=Windsurf-ACP, committed=True, status=completed, onboard_logged=True |
-| W6_irreversible_action_blocked | True | 0.04 | blocked=True, callback_ran=False |
-| W7_per_specialist_folder_agents_md_and_session_flag_failover | True | 1874.98 | specialist_dir_created=True, agents_md_loaded=True, first_attempt_error=SkillContractViolationError, chosen_backend=Codex-CLI, worktree_clean=True |
+| W1_trivial_fast_path | True | 177.22 | tier=trivial, status=completed, specialist_turns=1 |
+| W2_council_plan_review | True | 65.98 | first_consensus=False, second_consensus=True, gaps=['missing edge-case test for empty input'] |
+| W3_ambiguity_experiment | True | 288.62 | proceed=True, resolved_by=experiment |
+| W4_premature_completion_lesson_loop | True | 5933.77 | first_status=incomplete, retry_status=completed, lessons_injected=True |
+| W5_crash_revival_failover_hot_onboard | True | 2456.45 | attempts=['failed', 'succeeded'], claude_calls=1, chosen_backend=Windsurf-ACP, committed=True, status=completed, onboard_logged=True |
+| W6_irreversible_action_blocked | True | 0.05 | blocked=True, callback_ran=False |
+| W7_per_specialist_folder_agents_md_and_session_flag_failover | True | 2446.18 | specialist_dir_created=True, agents_md_loaded=True, claude_flags_ok=True, codex_flags_ok=True, first_attempt_error=SkillContractViolationError, chosen_backend=Codex-CLI, worktree_clean=True |
 
 All 7 workloads OK: **True**
 
