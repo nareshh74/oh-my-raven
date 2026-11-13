@@ -4,7 +4,14 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from oh_my_raven.gate import CouncilVote, LessonsStore, GatePolicy, classify_triage_tier, escalate_triage_tier, evaluate_council_consensus
-from oh_my_raven.oh_my_raven import OmrDispatcher
+from pathlib import Path
+
+from oh_my_raven.oh_my_raven import (
+    OmrDispatcher,
+    SessionHarnessFlagBuilder,
+    SpecialistDefinition,
+    SpecialistFolderManager,
+)
 
 
 def _persist_entries(path, worker):
@@ -243,3 +250,60 @@ def test_onboard_specialist_merges_via_public_table_backend_and_deduplicates_tar
     assert merged is rb
     assert [t.name for t in rb._targets] == ["H1", "H2"]
     assert rb is not decoy and [t.name for t in decoy._targets] == ["X"]
+
+
+def _materialized_specialist(tmp_path):
+    ext_skills = tmp_path / "ext_skills"
+    pack = ext_skills / "superpowers"
+    (pack / "scripts").mkdir(parents=True)
+    (pack / "SKILL.md").write_text("# Superpowers TDD", encoding="utf-8")
+    (pack / "scripts" / "verify_tdd.py").write_text("import sys; print('TDD_OK'); sys.exit(0)", encoding="utf-8")
+    spec = SpecialistDefinition(
+        name="Engineer-Superpowers",
+        role_prompt="Follow strict TDD and clean architecture.",
+        skill_packs=("superpowers", "ecc"),
+        disabled_skills=("legacy-pack",),
+        mcp_servers=("codebase-memory", "trail"),
+        disabled_mcp_servers=("github",),
+        strict_mcp_scope=True,
+        plugins=("omr-guard",),
+        disabled_plugins=("noisy-hook",),
+        allowed_tools=("read_file", "patch"),
+        denied_tools=("rm",),
+    )
+    return SpecialistFolderManager.ensure_specialist_dir(spec, tmp_path / "specialists", extra_skill_roots=[ext_skills])
+
+
+def test_specialist_folder_manager_agents_md_roundtrip_and_layout(tmp_path):
+    mat = _materialized_specialist(tmp_path)
+    folder = tmp_path / "specialists" / "engineer-superpowers"
+    assert (folder / "AGENTS.md").is_file() and (folder / "mcp.json").is_file()
+    assert (folder / "skills" / "superpowers" / "SKILL.md").is_file()
+    assert (folder / "skills" / "superpowers" / "scripts" / "verify_tdd.py").is_file()
+    assert (folder / "skills" / "ecc" / "SKILL.md").is_file()
+    loaded = SpecialistDefinition.from_agents_md(Path(mat.specialist_dir))
+    assert loaded.name == "Engineer-Superpowers"
+    assert loaded.resolved_slug == "engineer-superpowers"
+    for field in ("skill_packs", "disabled_skills", "mcp_servers", "disabled_mcp_servers", "strict_mcp_scope",
+                  "plugins", "disabled_plugins", "allowed_tools", "denied_tools"):
+        assert getattr(loaded, field) == getattr(mat, field), field
+    assert loaded.role_prompt == "Follow strict TDD and clean architecture."
+
+
+def test_session_harness_flag_builder_all_four_harnesses(tmp_path):
+    mat = _materialized_specialist(tmp_path)
+    args = {h: list(SessionHarnessFlagBuilder.build_for_candidate(mat, h)["session_cli_args"])
+            for h in ("Claude-Code", "Codex-CLI", "Copilot-CLI", "Hermes-CLI")}
+    claude = args["Claude-Code"]
+    for flag in ("--add-dir", "--strict-mcp-config", "--mcp-config", "--plugin-dir", "--allowedTools", "--disallowedTools"):
+        assert flag in claude, flag
+    assert any("mcp__github__*" in a for a in claude)
+    codex = args["Codex-CLI"]
+    assert "-c" in codex and any(a.startswith("skills.dirs=") for a in codex)
+    assert "mcp_servers.codebase-memory.enabled=true" in codex and "mcp_servers.github.enabled=false" in codex
+    assert "--enable" in codex and "--disable" in codex
+    for flag in ("--add-dir", "--disable-builtin-mcps", "--additional-mcp-config", "--enable-mcp-server",
+                 "--disable-mcp-server", "--plugin-dir", "--available-tools", "--excluded-tools"):
+        assert flag in args["Copilot-CLI"], flag
+    for flag in ("-s", "-t", "--safe-mode"):
+        assert flag in args["Hermes-CLI"], flag

@@ -25,7 +25,9 @@ sys.path.insert(0, str(ROOT / "tests"))
 import conftest  # noqa: E402,F401  (aliases raven.agent.subagent.* to this repo's oh_my_raven)
 from opentelemetry import trace as otel_trace  # noqa: E402
 
-from oh_my_raven.oh_my_raven import OmrDispatcher, OmrTaskQueue, WorktreeManager  # noqa: E402
+from oh_my_raven.oh_my_raven import (  # noqa: E402
+    OmrDispatcher, OmrTaskQueue, SpecialistDefinition, WorktreeManager,
+)
 from oh_my_raven.routing import RouteTarget, RoutingBackend  # noqa: E402
 
 REPORT = ROOT / "docs" / "DOGFOOD_EXPERIMENT_REPORT.md"
@@ -280,6 +282,52 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
         return {"ok": blocked and not pushed, "blocked": blocked, "callback_ran": bool(pushed)}
     timed("W6_irreversible_action_blocked", w6)
 
+    def w7():
+        wt = _wt(repo, tmp, "w7")
+        pack = tmp / "w7_ext_skills" / "superpowers"
+        (pack / "scripts").mkdir(parents=True)
+        (pack / "SKILL.md").write_text("# Superpowers", encoding="utf-8")
+        (pack / "scripts" / "check_arch.py").write_text("print('ARCH_OK')\n", encoding="utf-8")
+        seen: dict[str, Any] = {}
+
+        def claude(s, task, kw):
+            return json.dumps({"invoked_mcps": [], "skill_evidence": {}})
+
+        def codex(s, task, kw):
+            sdir = Path(kw["specialist_dir"])
+            seen["folder_ok"] = (sdir / "AGENTS.md").is_file() and (sdir / "mcp.json").is_file()
+            r = subprocess.run([sys.executable, str(sdir / "skills" / "superpowers" / "scripts" / "check_arch.py")],
+                               capture_output=True, text=True, check=True)
+            (wt / "arch_ok.txt").write_text("ok", encoding="utf-8")
+            git(wt, "add", "-A")
+            git(wt, "commit", "-q", "-m", "arch verified")
+            return json.dumps({"evidence": {"artifact_path": "arch_ok.txt"}, "invoked_mcps": ["codebase-memory"],
+                               "skill_evidence": {"superpowers": {"command": "python check_arch.py", "exit_code": 0,
+                                                                  "output_ref": r.stdout.strip()}}})
+        spec = SpecialistDefinition(name="Arch-Verifier", skill_packs=("superpowers",), skill_dirs=(str(pack.parent),),
+                                    mcp_servers=("codebase-memory",), disabled_mcp_servers=("github",),
+                                    strict_mcp_scope=True)
+        rb = d.onboard_specialist("Arch-Verifier", [RouteTarget("Claude-Code", "Claude-Code", Stub("Claude-Code", claude)),
+                                                    RouteTarget("Codex-CLI", "Codex-CLI", Stub("Codex-CLI", codex))],
+                                  specialist_definition=spec, require_skill_evidence=True)
+        d.workdir = wt
+        try:
+            asyncio.run(d.dispatch_specialist_node("W7", "Arch-Verifier", "verify architecture", workspace=wt, writes=True))
+        finally:
+            d.workdir = repo
+        sdef = rb.specialist_definition
+        sdir = Path(sdef.specialist_dir) if sdef.specialist_dir else None
+        created = bool(sdir and (sdir / "AGENTS.md").is_file())
+        loaded = created and SpecialistDefinition.from_agents_md(sdir).resolved_slug == "arch-verifier"
+        first_err = rb.last_attempts[0].get("error_class")
+        chosen = str(rb.last_chosen_backend)
+        clean = git(wt, "status", "--porcelain", "-uall") == "" and not (wt / "AGENTS.md").exists()
+        return {"ok": bool(created and loaded and seen.get("folder_ok") and first_err == "SkillContractViolationError"
+                           and chosen == "Codex-CLI" and clean),
+                "specialist_dir_created": created, "agents_md_loaded": bool(loaded), "first_attempt_error": first_err,
+                "chosen_backend": chosen, "worktree_clean": clean}
+    timed("W7_per_specialist_folder_agents_md_and_session_flag_failover", w7)
+
     spans = _span_rows(cap)
     by_name = Counter(s["name"] for s in spans)
     attempt_events = sum(1 for s in spans for e in s["events"] if e["name"] == "omr.routing.attempt")
@@ -288,7 +336,7 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
     return {
         "span_capture": cap_kind,
         "workloads": results,
-        "all_ok": len(results) == 6 and all(r["ok"] for r in results.values()),
+        "all_ok": len(results) == 7 and all(r["ok"] for r in results.values()),
         "spans_total": len(spans),
         "spans_by_name": dict(sorted(by_name.items())),
         "routing_attempt_events": attempt_events,
@@ -310,7 +358,7 @@ def render_report(s: dict[str, Any]) -> str:
     for k, r in s["workloads"].items():
         detail = ", ".join(f"{a}={b}" for a, b in r.items() if a not in ("ok", "latency_ms"))
         lines.append(f"| {k} | {r['ok']} | {r['latency_ms']} | {detail} |")
-    lines += ["", f"All 6 workloads OK: **{s['all_ok']}**", "", "## Monitoring receipts", "",
+    lines += ["", f"All 7 workloads OK: **{s['all_ok']}**", "", "## Monitoring receipts", "",
               f"- OTel spans captured: {s['spans_total']} (`{json.dumps(s['spans_by_name'])}`)",
               f"- `omr.routing.attempt` events: {s['routing_attempt_events']}",
               f"- `gate_log.json` entries: {s['gate_log_entries']} (`{json.dumps(s['gate_log_gates'])}`)",

@@ -319,6 +319,64 @@ class TestOutsideInScope:
         assert json.loads(d.gate_log_path.read_text())[0]["gate"] == "technical_decision"
         assert not list(d.gate_log_path.parent.glob(".gate_log.json.*.tmp"))
 
+    def test_outside_in_per_specialist_folder_subprocess_and_skill_mcp_failover(self, tmp_path):
+        repo = _init_repo(tmp_path)
+        wt = WorktreeManager().provision_worktree(repo, tmp_path / "wts", "run-spec-dir", "slice-1")
+        _git(wt, "config", "user.email", "t@example.com")
+        _git(wt, "config", "user.name", "t")
+        pack = tmp_path / "ext_skills" / "superpowers"
+        (pack / "scripts").mkdir(parents=True)
+        (pack / "SKILL.md").write_text("# Superpowers", encoding="utf-8")
+        (pack / "scripts" / "verify_tdd.py").write_text("print('SUPERPOWERS_SCRIPT_VERIFIED')\n", encoding="utf-8")
+        seen: dict[str, Any] = {}
+
+        class _Claude:
+            name, kind, streams = "Claude-Code", "cli", False
+
+            async def run(self, task, **kw):
+                seen["claude_args"] = list(kw["session_cli_args"])
+                return json.dumps({"invoked_mcps": [], "skill_evidence": {}})
+
+        class _Copilot:
+            name, kind, streams = "Copilot-CLI", "cli", False
+
+            async def run(self, task, **kw):
+                args = list(kw["session_cli_args"])
+                assert "--add-dir" in args and "--enable-mcp-server" in args
+                assert Path(kw["agents_md_path"]).read_text(encoding="utf-8")
+                script = Path(kw["specialist_dir"]) / "skills" / "superpowers" / "scripts" / "verify_tdd.py"
+                proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, check=True)
+                seen["script"] = script
+                (wt / "verified_feature.py").write_text("X = 1\n", encoding="utf-8")
+                _git(wt, "add", "-A")
+                _git(wt, "commit", "-q", "-m", "verified feature")
+                return json.dumps({
+                    "evidence": {"artifact_path": "verified_feature.py"},
+                    "invoked_mcps": ["codebase-memory"], "invoked_tools": ["read_file"],
+                    "skill_evidence": {"superpowers": {"command": "python verify_tdd.py", "exit_code": 0,
+                                                       "output_ref": proc.stdout.strip()}},
+                })
+
+        flaky, good = _Claude(), _Copilot()
+        dispatcher = _dispatcher(tmp_path, wt, _Table({}))
+        tdd_spec = dispatcher.onboard_specialist(
+            "TDD-Implementer",
+            [RouteTarget("Claude-Code", "primary", flaky), RouteTarget("Copilot-CLI", "fallback", good)],
+            specialist_definition={"name": "TDD-Implementer", "role_prompt": "Strict TDD specialist.",
+                                   "skill_packs": ["superpowers"], "skill_dirs": [str(pack.parent)],
+                                   "mcp_servers": ["codebase-memory"], "disabled_mcp_servers": ["github"],
+                                   "strict_mcp_scope": True},
+            require_skill_evidence=True,
+        )
+        asyncio.run(dispatcher.dispatch_specialist_node(
+            "SPEC-DIR-1", "TDD-Implementer", "Implement feature with superpowers", workspace=wt, writes=True))
+        assert "--add-dir" in seen["claude_args"] and "--strict-mcp-config" in seen["claude_args"]
+        assert tdd_spec.last_attempts[0]["error_class"] == "SkillContractViolationError"
+        assert tdd_spec.last_chosen_backend == "Copilot-CLI"
+        assert seen["script"].is_file() and wt not in seen["script"].parents
+        assert _git(wt, "status", "--porcelain", "-uall") == ""
+        assert not (wt / "AGENTS.md").exists() and not (wt / "mcp.json").exists()
+
     def test_outside_in_hot_onboard_new_specialist_and_new_harness_zero_profile_setup(self, tmp_path):
         repo = _init_repo(tmp_path)
         base = _git(repo, "rev-parse", "HEAD")
