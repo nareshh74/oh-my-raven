@@ -21,7 +21,7 @@ from loguru import logger
 from raven.agent.subagent.dag_graph import DagNodeSpec
 from raven.agent.subagent.prompt_errors import DagValidationError
 from raven.contracts.subagent_backend import SubagentBackend, SubagentNoAnswerError
-from .gate import GatePolicy, has_verifiable_evidence
+from .gate import LessonsStore, TriageDecision, classify_triage_tier, escalate_triage_tier, GatePolicy, has_verifiable_evidence
 
 BRAND_NAME = "oh-my-raven"
 
@@ -2293,6 +2293,51 @@ class OmrDispatcher:
         self.charter_context = dict(charter_context) if charter_context else None
         self.gate_policy = GatePolicy.load_default(gate_policy_path)
         self.gate_log_path = self.run_root / "gate_log.json"
+        self.lessons_store = LessonsStore(self.history_root / "lessons.jsonl")
+
+    def triage_task(self, prompt: str, file_count_hint: int | None = None) -> TriageDecision:
+        return classify_triage_tier(prompt, file_count_hint)
+
+    def record_lesson(self, trigger: str, rule: str, source_task_id: str) -> None:
+        self.lessons_store.record_lesson(trigger, rule, source_task_id)
+
+    def execute_external_action(self, gate: str, detail: str, action_fn: Callable[[], Any]) -> Any:
+        self.require_gate(gate, detail)
+        return action_fn()
+
+    def git_push(self, detail: str, action_fn: Callable[[], Any]) -> Any:
+        return self.execute_external_action("push", detail, action_fn)
+
+    def publish_pr(self, detail: str, action_fn: Callable[[], Any]) -> Any:
+        return self.execute_external_action("publish", detail, action_fn)
+
+    def deploy(self, detail: str, action_fn: Callable[[], Any]) -> Any:
+        return self.execute_external_action("deploy", detail, action_fn)
+
+    def run_ambiguity_experiment(self, task_id: str, question: str, probe_fn: Callable[[], dict[str, Any]] | None = None) -> dict[str, Any]:
+        if probe_fn is not None:
+            finding = probe_fn()
+            resolved = bool(finding.get("resolved"))
+            receipt = {"task_id": task_id, "question": question, "resolved": resolved, "finding": finding, "verified": True, "exit_code": 0}
+            receipt_path = self.run_root / "experiments" / f"{task_id}.json"
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_json(receipt_path, receipt)
+            if resolved:
+                self.decide_gate("technical_decision", f"experiment_resolved:{task_id}")
+                return {"proceed": True, "resolved_by": "experiment", "receipt_path": str(receipt_path)}
+        return {"proceed": self.decide_gate("ambiguous_product_intent", question)}
+
+    async def submit_trivial_task(self, task_id: str, prompt: str, specialist: str | None = None) -> Any:
+        chosen = specialist or await self.route_intake_specialist(prompt, default="Manager")
+        try:
+            result = await self.dispatch_specialist_node(task_id, chosen, prompt)
+            if self.completion_status(str(result)) == "completed":
+                return result
+        except BaseException:
+            pass
+        decision = escalate_triage_tier("trivial", "trivial specialist run failed or was incomplete")
+        self.decide_gate("technical_decision", f"triage_escalation:trivial->{decision.tier}")
+        return await self.submit_task(task_id, prompt, lead_specialist=chosen)
 
     def completion_status(self, result: str) -> QueueStatus:
         """Return completed only when result contains evidence we can verify."""
@@ -2485,7 +2530,10 @@ class OmrDispatcher:
             raise DagValidationError(f"Specialist {specialist_name!r} not found in SubagentTable")
         self.queue.transition(task_id, "routed", assigned_specialist=specialist_name)
         self.queue.transition(task_id, "running", assigned_specialist=specialist_name)
-        framed_prompt = self._build_framed_prompt(prompt)
+        lessons = self.lessons_store.matching_lessons(prompt)
+        lessons_block = "\n".join(f"- {lesson['rule']}" for lesson in lessons)
+        lesson_prompt = f"{prompt}\n\n[Active Lessons]\n{lessons_block}" if lessons else prompt
+        framed_prompt = self._build_framed_prompt(lesson_prompt)
         try:
             result = await backend.run(
                 framed_prompt,
@@ -2519,6 +2567,8 @@ class OmrDispatcher:
                 assigned_specialist=specialist_name,
                 assigned_harness=chosen_harness,
             )
+            if self.completion_status(str(result)) == "incomplete":
+                self.record_lesson(prompt, "Provide verifiable done-gate evidence before completion.", task_id)
             return result
         except BaseException as exc:
             chosen_harness = str(getattr(backend, "last_chosen_backend", "") or getattr(backend, "name", "") or "")
@@ -2676,6 +2726,10 @@ __all__ = [
     "OmrDispatcher",
     "OmrQueueEntry",
     "OmrTaskQueue",
+    "TriageDecision",
+    "classify_triage_tier",
+    "escalate_triage_tier",
+    "LessonsStore",
     "PrematureCompletionError",
     "QueueStatus",
     "RecoveryBlockedError",

@@ -63,6 +63,9 @@ from pathlib import Path
 from typing import Any, Iterator, NamedTuple
 
 from loguru import logger
+from opentelemetry import trace as otel_trace
+
+_TRACER = otel_trace.get_tracer("oh_my_raven")
 
 from raven.agent.subagent.attachments import turn_attachments_in_force
 from raven.agent.subagent.backends.base import optional_keyword
@@ -241,6 +244,16 @@ class TelemetryLogger:
                     fh.flush()
         except Exception as exc:  # noqa: BLE001
             logger.warning("specialist telemetry write failed for {}: {}", self.path, exc)
+
+    def record_routing_decision(self, record: dict[str, Any]) -> None:
+        with _TRACER.start_as_current_span("omr.routing.run") as span:
+            span.set_attribute("omr.specialist", str(record.get("specialist") or record.get("specialist_name") or ""))
+            attempts = record.get("attempts") or record.get("failover_chain") or []
+            span.set_attribute("omr.attempts", len(attempts))
+            span.set_attribute("omr.chosen_backend", str(record.get("chosen_backend") or ""))
+            for attempt in attempts:
+                span.add_event("omr.routing.attempt", attributes={k: v for k, v in attempt.items() if isinstance(v, (str, bool, int, float))})
+            self.write_record(record)
 
 
 
@@ -1064,7 +1077,7 @@ class RoutingBackend(SubagentBackend):
                 chain[idx + 1].name,
             )
 
-    async def run(
+    async def _run(
         self,
         task: str,
         *,
@@ -1194,6 +1207,17 @@ class RoutingBackend(SubagentBackend):
             f"{self.name!r}: all {len(attempt_records)} failover attempts failed ({summary})",
             attempts=attempt_records,
         ) from last_exc
+
+    async def run(self, task: str, **kwargs: Any) -> str:
+        with _TRACER.start_as_current_span("omr.routing.run") as span:
+            try:
+                return await self._run(task, **kwargs)
+            finally:
+                span.set_attribute("omr.specialist", self.name)
+                span.set_attribute("omr.attempts", len(self.last_attempts))
+                span.set_attribute("omr.chosen_backend", str(getattr(self, "last_chosen_backend", "") or ""))
+                for attempt in self.last_attempts:
+                    span.add_event("omr.routing.attempt", attributes={k: v for k, v in attempt.items() if isinstance(v, (str, bool, int, float))})
 
 
 __all__ = [

@@ -1,8 +1,17 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from oh_my_raven.gate import GatePolicy
+from oh_my_raven.gate import LessonsStore, GatePolicy, classify_triage_tier, escalate_triage_tier
+from oh_my_raven.oh_my_raven import OmrDispatcher
+
+
+def _persist_entries(path, worker):
+    for item in range(5):
+        policy = GatePolicy()
+        policy.decide("technical_decision", f"{worker}:{item}")
+        policy.persist_log(path)
 
 
 def test_defaults():
@@ -110,3 +119,54 @@ def test_persist_log_replace_oserror_keeps_memory_log_and_no_tmp(tmp_path, monke
         gp.persist_log(log_path)
     assert gp.log == [{"gate": "technical_decision", "detail": "x"}]
     assert list(tmp_path.glob(".*.tmp")) == [] and not log_path.exists()
+
+
+def test_persist_log_concurrent_writers_preserve_all_entries(tmp_path):
+    path = tmp_path / "gate_log.json"
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda worker: _persist_entries(path, worker), range(4)))
+    assert len(json.loads(path.read_text(encoding="utf-8"))) == 20
+
+
+def test_triage_and_escalation():
+    assert classify_triage_tier("fix typo", 1).tier == "trivial"
+    assert classify_triage_tier("not sure which approach?").tier == "ambiguous-novel"
+    decision = escalate_triage_tier("trivial", "failed")
+    assert decision.tier == "standard" and decision.escalated_from == "trivial"
+
+
+def test_lessons_store_matches_trigger(tmp_path):
+    store = LessonsStore(tmp_path / "lessons.jsonl")
+    store.record_lesson("pytest evidence", "Run focused tests", "task-1")
+    assert store.matching_lessons("add pytest evidence")[0]["rule"] == "Run focused tests"
+
+
+def test_gate_emits_opentelemetry_span(monkeypatch):
+    seen = []
+    class Span:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def set_attribute(self, key, value): seen.append((key, value))
+    monkeypatch.setattr("oh_my_raven.gate._TRACER.start_as_current_span", lambda name: Span())
+    GatePolicy().decide("technical_decision", "pick")
+    assert ("omr.gate.name", "technical_decision") in seen
+
+
+def test_ambiguity_experiment_resolves_before_ask(tmp_path):
+    dispatcher = object.__new__(OmrDispatcher)
+    dispatcher.run_root = tmp_path
+    dispatcher.gate_policy = GatePolicy()
+    dispatcher.gate_log_path = tmp_path / "gate_log.json"
+    result = dispatcher.run_ambiguity_experiment("t1", "which?", lambda: {"resolved": True, "answer": "a"})
+    assert result["proceed"] is True and result["resolved_by"] == "experiment"
+    assert json.loads((tmp_path / "experiments" / "t1.json").read_text())["verified"] is True
+
+
+def test_execute_external_action_blocks_before_side_effect():
+    dispatcher = object.__new__(OmrDispatcher)
+    dispatcher.gate_policy = GatePolicy()
+    dispatcher.gate_log_path = __import__("pathlib").Path("unused.json")
+    called = []
+    with pytest.raises(PermissionError):
+        dispatcher.execute_external_action("push", "origin", lambda: called.append(True))
+    assert called == []

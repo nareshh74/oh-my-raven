@@ -14,6 +14,12 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Literal
+
+import portalocker
+from opentelemetry import trace as otel_trace
+
+_TRACER = otel_trace.get_tracer("oh_my_raven")
 
 MODES = ("ask", "auto-log", "auto")
 IRREVERSIBLE = frozenset({"push", "publish", "spend", "deploy", "delete_remote"})
@@ -54,9 +60,15 @@ class GatePolicy:
     def decide(self, gate: str, detail: str = "") -> bool:
         """True = proceed autonomously; False = must ask the human."""
         m = self.mode(gate)
-        if m == "auto-log":
-            self.log.append({"gate": gate, "detail": detail})
-        return m != "ask"
+        allowed = m != "ask"
+        with _TRACER.start_as_current_span(f"omr.gate.{gate}") as span:
+            span.set_attribute("omr.gate.name", gate)
+            span.set_attribute("omr.gate.mode", m)
+            span.set_attribute("omr.gate.allowed", allowed)
+            span.set_attribute("omr.gate.detail", detail)
+            if m == "auto-log":
+                self.log.append({"gate": gate, "detail": detail})
+        return allowed
 
     @classmethod
     def load_default(cls, path: str | Path | None = None) -> "GatePolicy":
@@ -64,25 +76,76 @@ class GatePolicy:
 
     def persist_log(self, path: str | Path) -> None:
         p = Path(path)
-        try:
-            existing = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            existing = []
-        if not isinstance(existing, list):
-            existing = []
-        payload = json.dumps(existing + self.log, indent=2) + "\n"
-        fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), prefix=f".{p.name}.", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-            os.replace(tmp_path, p)
-        except Exception:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with portalocker.Lock(str(p) + ".lock", timeout=10):
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+                existing = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                existing = []
+            if not isinstance(existing, list):
+                existing = []
+            payload = json.dumps(existing + self.log, indent=2) + "\n"
+            fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), prefix=f".{p.name}.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                os.replace(tmp_path, p)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         self.log.clear()
+
+
+@dataclass(frozen=True)
+class TriageDecision:
+    tier: Literal["trivial", "standard", "ambiguous-novel"]
+    rationale: str
+    confidence: float
+    escalated_from: str | None = None
+
+
+def classify_triage_tier(prompt: str, file_count_hint: int | None = None) -> TriageDecision:
+    text = prompt.lower()
+    ambiguity = ("?", "not sure", "either", "ambiguous", "explore", "versus", "tradeoff", "experiment")
+    if any(marker in text for marker in ambiguity):
+        return TriageDecision("ambiguous-novel", "prompt contains ambiguity or novelty markers", 0.9)
+    multi = ("req-", "dag", "multi-tenant", "(1)", "(2)", "(3)")
+    if file_count_hint == 1 or (len(prompt.split()) < 25 and not any(marker in text for marker in multi)):
+        return TriageDecision("trivial", "small single-scope task", 0.85)
+    return TriageDecision("standard", "task requires normal orchestration", 0.75)
+
+
+def escalate_triage_tier(current: str, reason: str) -> TriageDecision:
+    next_tier = {"trivial": "standard", "standard": "ambiguous-novel"}.get(current)
+    if next_tier is None:
+        raise ValueError(f"cannot escalate triage tier {current!r}")
+    return TriageDecision(next_tier, reason, 1.0, escalated_from=current)
+
+
+class LessonsStore:
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    def record_lesson(self, trigger: str, rule: str, source_task_id: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {"trigger": trigger, "rule": rule, "source_task_id": source_task_id, "active": True}
+        with portalocker.Lock(str(self.path) + ".lock", timeout=10):
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def matching_lessons(self, prompt: str) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        words = set(re.findall(r"[a-z0-9_-]+", prompt.lower()))
+        with portalocker.Lock(str(self.path) + ".lock", timeout=10):
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        lessons = [json.loads(line) for line in lines if line.strip()]
+        return [lesson for lesson in lessons if lesson.get("active", True) and (
+            not lesson.get("trigger") or words.intersection(re.findall(r"[a-z0-9_-]+", str(lesson["trigger"]).lower()))
+        )]
 
 _TEST_PATH_RE = re.compile(r"^tests?/[A-Za-z0-9_./-]+$")
 _TEST_FILE_RE = re.compile(r"^test_[A-Za-z0-9_.-]+\.py$")
