@@ -2446,6 +2446,7 @@ class OmrDispatcher:
 
         node_waves = plan.node_waves
         by_id = {n.id: n for n in plan.dag_spec.nodes}
+        node_outputs: dict[str, str] = {}
         for node in plan.dag_spec.nodes:
             self.queue.transition(
                 node.id,
@@ -2458,7 +2459,19 @@ class OmrDispatcher:
             resolved = self.table.backend(node.subagent, build=node)
             if resolved is not None and self.charter_context:
                 setattr(resolved, "charter_context", self.charter_context)
-            return resolved
+            if resolved is None:
+                return None
+
+            class _CapturingBackend:
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(resolved, name)
+
+                async def run(self, *args: Any, **kwargs: Any) -> Any:
+                    result = await resolved.run(*args, **kwargs)
+                    node_outputs[node.id] = str(result)
+                    return result
+
+            return _CapturingBackend()
 
         async def _on_node_start(nid: str) -> None:
             node_obj = by_id.get(nid)
@@ -2479,13 +2492,16 @@ class OmrDispatcher:
                     h_name = str(getattr(b_obj, "last_chosen_backend", "") or "")
                     self.queue.transition(
                         nid,
-                        self.completion_status(str(payload.get("output") or "")) if st == "completed" else "failed",
+                        self.completion_status(str(
+                            payload.get("output") or payload.get("result") or payload.get("summary")
+                            or node_outputs.get(nid, "")
+                        )) if st == "completed" else "failed",
                         assigned_specialist=node_obj.subagent,
                         assigned_harness=h_name,
                         wave=node_waves.get(nid, 0),
                     )
 
-        return await run_dag(
+        result = await run_dag(
             plan.dag_spec,
             resolve=_resolve_from_table,
             backend=LocalFileBackend(),
@@ -2500,6 +2516,22 @@ class OmrDispatcher:
             progress_publisher=_progress_pub,
             judge_node=judge_node or self._default_dag_judge,
         )
+        for file_entry in result.files:
+            nid = str(file_entry.get("node") or "")
+            if file_entry.get("status") != "completed" or nid not in by_id:
+                continue
+            output = file_entry.get("output") or file_entry.get("result") or file_entry.get("summary")
+            output = output or node_outputs.get(nid, "")
+            node_obj = by_id[nid]
+            backend_obj = self.table.backend(node_obj.subagent)
+            self.queue.transition(
+                nid,
+                self.completion_status(str(output or "")),
+                assigned_specialist=node_obj.subagent,
+                assigned_harness=str(getattr(backend_obj, "last_chosen_backend", "") or ""),
+                wave=node_waves.get(nid, 0),
+            )
+        return result
 
     async def dispatch_specialist_node(
         self,
