@@ -71,6 +71,9 @@ from raven.agent.subagent.mode_tiers import turn_tier_in_force
 from raven.config.schema import TIER_LADDER
 from raven.contracts.subagent_backend import SubagentActionAbortedError, SubagentBackend, SubagentNoAnswerError
 
+#: Default bound on total attempts (revival of a transient-failing harness).
+DEFAULT_MAX_ATTEMPTS: int = 3
+
 #: ``(menu, task, default) -> chosen name or None``; ``menu`` is ``[(name, description), ...]``.
 Router = Callable[[list[tuple[str, str]], str, str], Awaitable[str | None]]
 
@@ -348,7 +351,7 @@ class RoutingBackend(SubagentBackend):
         instances: Any,
         target_ready: TargetReady | None = None,
         max_failovers: int = 2,
-        max_attempts: int | None = None,
+        max_attempts: int | None = DEFAULT_MAX_ATTEMPTS,
         cooldown_s: float = 60.0,
         max_review_cycles: int = 3,
         clock: Callable[[], float] = time.monotonic,

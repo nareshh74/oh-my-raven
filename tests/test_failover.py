@@ -50,6 +50,14 @@ def test_revival_retries_same_harness_bounded():
     assert a.calls == 3 and len(rb.last_attempts) == 3
 
 
+def test_default_max_attempts_is_active_by_default():
+    a = Fake("a", fail=2, exc=ConnectionError)
+    rb = mk(a)
+    assert rb._max_attempts == 3
+    assert run(rb) == "a ok"
+    assert a.calls == 3
+
+
 def test_exhaustion_surfaces_attempt_log():
     a = Fake("a", fail=99)
     rb = mk(a, max_attempts=3)
