@@ -25,3 +25,13 @@ def test_invalid_mode(tmp_path):
     f.write_text(json.dumps({"modes": {"x": "yolo"}}))
     with pytest.raises(ValueError):
         GatePolicy.load(f)
+
+
+def test_persist_log_preserves_entries_from_prior_policy(tmp_path):
+    path = tmp_path / "gate_log.json"
+    first, second = GatePolicy(), GatePolicy()
+    first.decide("technical_decision", "first")
+    first.persist_log(path)
+    second.decide("plan_gap", "second")
+    second.persist_log(path)
+    assert [entry["detail"] for entry in json.loads(path.read_text())] == ["first", "second"]

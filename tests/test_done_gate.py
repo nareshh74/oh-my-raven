@@ -19,7 +19,7 @@ def dispatcher(tmp_path, policy=None):
 
 def test_done_requires_successful_test_evidence(tmp_path):
     d = dispatcher(tmp_path)
-    assert d.completion_status(json.dumps({"evidence": {"test_command": "pytest", "exit_code": 0}})) == "completed"
+    assert d.completion_status(json.dumps({"evidence": {"test_command": 'python -c "assert True"', "exit_code": 0}})) == "completed"
     assert d.completion_status("done") == "incomplete"
     assert d.completion_status(json.dumps({"test_command": "pytest", "exit_code": 1})) == "incomplete"
 
@@ -75,7 +75,7 @@ def test_single_task_without_evidence_is_incomplete(tmp_path, monkeypatch):
 
     monkeypatch.setattr(m.SkillAndToolReceiptGate, "verify_specialist_execution", staticmethod(lambda *a, **k: None))
     assert _run_node(tmp_path, "done") == "incomplete"
-    good = json.dumps({"evidence": {"command": "pytest", "exit_code": 0}})
+    good = json.dumps({"evidence": {"command": 'python -c "assert True"', "exit_code": 0}})
     assert _run_node(tmp_path / "g", good) == "completed"
 
 
@@ -119,7 +119,7 @@ def _submit_with_output(tmp_path, monkeypatch, output):
 def test_dag_rollup_without_evidence_is_incomplete(tmp_path, monkeypatch):
     d = _submit_with_output(tmp_path / "bad", monkeypatch, "done")
     assert d.queue.latest_by_task()["parent"].status == "incomplete"
-    evidence = json.dumps({"evidence": {"command": "pytest", "exit_code": 0}})
+    evidence = json.dumps({"evidence": {"command": 'python -c "assert True"', "exit_code": 0}})
     d = _submit_with_output(tmp_path / "good", monkeypatch, evidence)
     assert d.queue.latest_by_task()["parent"].status == "completed"
 
@@ -128,9 +128,20 @@ def test_submit_task_consults_gate_policy_and_require_gate_blocks_irreversible(t
     d = _submit_with_output(
         tmp_path,
         monkeypatch,
-        json.dumps({"evidence": {"command": "pytest", "exit_code": 0}}),
+        json.dumps({"evidence": {"command": 'python -c "assert True"', "exit_code": 0}}),
     )
     gates = [entry["gate"] for entry in json.loads(d.gate_log_path.read_text())]
     assert gates == ["specialist_fallback", "technical_decision"]
     with pytest.raises(PermissionError, match="requires human approval"):
         d.require_gate("push", "origin/main")
+
+
+@pytest.mark.parametrize("command", [
+    "pytest test_missing_file.py",
+    'python -c "import sys; sys.exit(1)"',
+    "nonexistent_binary_xyz",
+])
+def test_fabricated_failing_or_nonexistent_command_claim_is_rejected(tmp_path, command):
+    d = dispatcher(tmp_path)
+    claim = json.dumps({"evidence": {"command": command, "exit_code": 0}})
+    assert d.completion_status(claim) == "incomplete"
