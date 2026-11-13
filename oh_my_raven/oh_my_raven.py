@@ -2339,22 +2339,14 @@ class OmrDispatcher:
         if not route_targets:
             raise ValueError("A dynamic specialist requires at least one harness target")
         existing = None
-        for attr in ("_backends", "_b"):
-            registered = getattr(self.table, attr, None)
-            if isinstance(registered, dict) and isinstance(registered.get(name), RoutingBackend):
-                existing = registered[name]
-                break
-        if existing is None:
-            for method_name in ("backend", "get_backend"):
-                getter = getattr(self.table, method_name, None)
-                if callable(getter):
-                    try:
-                        candidate = getter(name)
-                    except (KeyError, ValueError, LookupError):
-                        candidate = None
-                    if isinstance(candidate, RoutingBackend):
-                        existing = candidate
-                        break
+        getter = getattr(self.table, "backend", None)
+        if callable(getter):
+            try:
+                candidate = getter(name)
+            except (KeyError, ValueError, LookupError):
+                candidate = None
+            if isinstance(candidate, RoutingBackend):
+                existing = candidate
         if existing is not None and not replace:
             target_names = {target.name for target in existing._targets}
             for target in route_targets:

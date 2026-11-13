@@ -210,13 +210,16 @@ def test_dispatcher_council_persists_and_records_gaps(tmp_path):
 
 
 def test_onboard_specialist_merges_via_public_table_backend_and_deduplicates_targets(tmp_path):
-    from types import SimpleNamespace
+    from types import MappingProxyType, SimpleNamespace
     from oh_my_raven.oh_my_raven import OmrTaskQueue
     from oh_my_raven.routing import RouteTarget, RoutingBackend
+
+    decoy = RoutingBackend("Sec-Audit", SimpleNamespace(name="X"), [RouteTarget("X", "X", SimpleNamespace(name="X"))], instances=None)
 
     class Table:
         def __init__(self):
             self.registry = {}
+            self._backends = MappingProxyType({"Sec-Audit": decoy})  # read-only decoy: registration goes via onboard()
 
         def backend(self, name):
             return self.registry[name]
@@ -239,3 +242,4 @@ def test_onboard_specialist_merges_via_public_table_backend_and_deduplicates_tar
     )
     assert merged is rb
     assert [t.name for t in rb._targets] == ["H1", "H2"]
+    assert rb is not decoy and [t.name for t in decoy._targets] == ["X"]
