@@ -12,13 +12,16 @@ from typing import Any
 
 import pytest
 
-from raven.agent.subagent.backends.routing import (
+import inspect
+
+from oh_my_raven.routing import (
     RouteTarget,
     RoutingBackend,
     SubagentFailoverBlockedError,
+    SubagentFailoverExhaustedError,
 )
 from raven.agent.subagent.dag_graph import DagNodeSpec, SubAgentDagSpec
-from raven.agent.subagent.oh_my_raven import (
+from oh_my_raven.oh_my_raven import (
     AcceptanceReceipt,
     BRAND_NAME,
     CommandReceipt,
@@ -1737,3 +1740,11 @@ def test_11_seven_by_five_specialist_harness_matrix_hot_onboarding_and_crash_fai
 
     # Cleanup dirty_wt
     _git(rig.repo, "worktree", "remove", "--force", str(dirty_wt), check=False)
+
+
+def test_candidate_module_source_of_truth_is_local_repo() -> None:
+    pkg = (Path(__file__).resolve().parent.parent / "oh_my_raven").resolve()
+    for obj in (OmrDispatcher, RoutingBackend):
+        assert obj.__module__.startswith("oh_my_raven")
+        src = Path(inspect.getsourcefile(obj)).resolve()
+        assert src.is_relative_to(pkg), src
