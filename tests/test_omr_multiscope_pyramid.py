@@ -168,6 +168,48 @@ def _ledger(root: Path) -> list[dict]:
 
 
 class TestIntegrationScope:
+    def test_integration_triage_trivial_fast_path_and_auto_escalation(self, tmp_path):
+        class TrivialThenManager(_Manager):
+            def __init__(self):
+                self.calls = 0
+
+            async def run(self, task, **kw):
+                self.calls += 1
+                return "incomplete" if self.calls == 1 else _dag_payload()
+
+        repo = _init_repo(tmp_path)
+        manager = TrivialThenManager()
+        table = _Table({"Manager": _routing("Manager", manager),
+                        "Worker": _routing("Worker", _Worker(repo, _write_deliverable)),
+                        "CTO": _routing("CTO", _Cto()),
+                        "Reviewer": _routing("Reviewer", _Reviewer(repo))})
+        d = _dispatcher(tmp_path, repo, table)
+        assert d.triage_task("fix typo", 1).tier == "trivial"
+        asyncio.run(d.submit_trivial_task("T", "fix typo", "Manager"))
+        assert manager.calls >= 2
+        assert d.queue.latest_by_task()["T"].status == "completed"
+
+    def test_integration_lessons_loop_auto_records_and_injects_on_retry(self, tmp_path):
+        class LearningWorker:
+            name, kind, streams = "Worker", "acp", False
+
+            def __init__(self, repo):
+                self.repo, self.prompts, self.calls = repo, [], 0
+
+            async def run(self, task, **kw):
+                self.prompts.append(task)
+                self.calls += 1
+                return "incomplete" if self.calls == 1 else _write_deliverable(self.repo)
+
+        repo = _init_repo(tmp_path)
+        worker = LearningWorker(repo)
+        d = _dispatcher(tmp_path, repo, _Table({"Worker": _routing("Worker", worker)}))
+        asyncio.run(d.dispatch_specialist_node("L1", "Worker", "build durable feature"))
+        asyncio.run(d.dispatch_specialist_node("L2", "Worker", "build durable feature"))
+        assert (tmp_path / "history" / "lessons.jsonl").is_file()
+        assert "[Active Lessons]" in worker.prompts[1]
+        assert d.queue.latest_by_task()["L2"].status == "completed"
+
     def test_integration_real_dag_runner_and_decomposition_with_done_gate(self, tmp_path):
         d = _submit(tmp_path, _write_deliverable)
         assert (d.workdir / "deliverable.json").is_file()
@@ -179,10 +221,6 @@ class TestIntegrationScope:
         assert ("PARENT", "decomposing") in seen and ("PARENT", "running") in seen
         assert d.queue.latest_by_task()["PARENT"].status in {"completed", "incomplete"}
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "PRODUCT GAP: real run_dag's final dag_node_updated event carries no 'output', so "
-        "OmrDispatcher._execute_decomposed_dag feeds '' to completion_status and every node "
-        "(and the parent) rolls up 'incomplete' even with a verified artifact. Fix in oh_my_raven.py."))
     def test_integration_real_dag_verified_evidence_rolls_up_completed(self, tmp_path):
         d = _submit(tmp_path, _write_deliverable)
         assert d.queue.latest_by_task()["PARENT"].status == "completed"
@@ -230,6 +268,36 @@ class _SubprocessHarness:
 
 
 class TestOutsideInScope:
+    def test_outside_in_ambiguity_experiment_resolves_without_asking_user(self, tmp_path):
+        repo = _init_repo(tmp_path)
+        d = _dispatcher(tmp_path, repo, _Table({}))
+
+        def probe():
+            proc = subprocess.run([sys.executable, "-c", "print('resolved')"], capture_output=True, text=True)
+            return {"resolved": proc.returncode == 0 and proc.stdout.strip() == "resolved"}
+
+        answer = d.run_ambiguity_experiment("A1", "which behavior?", probe)
+        assert answer["proceed"] and answer["resolved_by"] == "experiment"
+        assert (tmp_path / "runs" / "experiments" / "A1.json").is_file()
+        assert d.run_ambiguity_experiment("A2", "still unclear", lambda: {"resolved": False})["proceed"] is False
+
+    def test_outside_in_external_write_adapters_enforced_by_require_gate(self, tmp_path):
+        repo = _init_repo(tmp_path)
+        calls = []
+        d = _dispatcher(tmp_path, repo, _Table({}))
+        for action in (d.git_push, d.publish_pr, d.deploy):
+            with pytest.raises(PermissionError):
+                action("target", lambda: calls.append("called"))
+        assert calls == []
+        (tmp_path / "gate_policy.json").write_text(json.dumps({
+            "modes": {"push": "auto", "publish": "auto", "deploy": "auto"},
+            "allow_irreversible_auto": True,
+        }))
+        allowed = _dispatcher(tmp_path, repo, _Table({}))
+        for action in (allowed.git_push, allowed.publish_pr, allowed.deploy):
+            action("target", lambda: calls.append("called"))
+        assert calls == ["called"] * 3
+
     def test_outside_in_subprocess_harness_failover_and_revival_to_done_gate(self, tmp_path):
         repo = _init_repo(tmp_path)
         base = _git(repo, "rev-parse", "HEAD")
