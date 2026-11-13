@@ -2524,9 +2524,13 @@ class OmrDispatcher:
             output = output or node_outputs.get(nid, "")
             node_obj = by_id[nid]
             backend_obj = self.table.backend(node_obj.subagent)
+            final_status = self.completion_status(str(output or ""))
+            prev = self.queue.latest_by_task().get(nid)
+            if prev is not None and prev.status == final_status:
+                continue
             self.queue.transition(
                 nid,
-                self.completion_status(str(output or "")),
+                final_status,
                 assigned_specialist=node_obj.subagent,
                 assigned_harness=str(getattr(backend_obj, "last_chosen_backend", "") or ""),
                 wave=node_waves.get(nid, 0),

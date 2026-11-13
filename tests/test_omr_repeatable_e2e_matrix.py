@@ -584,7 +584,21 @@ class DeterministicHarnessBackend:
         self.last_invoked_tools = ("read_file", "write_file", "exec")
         self.last_invoked_mcps = tuple(mcps)
 
-    async def run(
+    async def run(self, task: str, *, task_id: str, **kwargs: Any) -> str:
+        out = await self._run_impl(task, task_id=task_id, **kwargs)
+        if task_id.endswith(("::cto_intake", "::decompose")):
+            return out
+        try:
+            data = json.loads(out)
+        except ValueError:
+            return out
+        if isinstance(data, dict) and "artifact_path" not in data:
+            # Verifiable done-gate evidence: an existing non-empty artifact in the repo.
+            data["artifact_path"] = "src/api/gateway.py"
+            return json.dumps(data)
+        return out
+
+    async def _run_impl(
         self,
         task: str,
         *,
