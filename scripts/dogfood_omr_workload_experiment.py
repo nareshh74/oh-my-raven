@@ -291,9 +291,18 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
         seen: dict[str, Any] = {}
 
         def claude(s, task, kw):
+            a = list(kw.get("session_cli_args") or ())
+            seen["claude_flags_ok"] = ("--add-dir" in a and "--strict-mcp-config" in a and "--mcp-config" in a
+                                       and "--allowedTools" in a and "--disallowedTools" in a
+                                       and any("mcp__github__*" in x for x in a))
             return json.dumps({"invoked_mcps": [], "skill_evidence": {}})
 
         def codex(s, task, kw):
+            a = list(kw.get("session_cli_args") or ())
+            seen["codex_flags_ok"] = ("-c" in a and any(x.startswith("skills.dirs=") for x in a)
+                                      and "mcp_servers.codebase-memory.enabled=true" in a
+                                      and "mcp_servers.github.enabled=false" in a
+                                      and "--enable" in a and "--disable" in a)
             sdir = Path(kw["specialist_dir"])
             seen["folder_ok"] = (sdir / "AGENTS.md").is_file() and (sdir / "mcp.json").is_file()
             r = subprocess.run([sys.executable, str(sdir / "skills" / "superpowers" / "scripts" / "check_arch.py")],
@@ -304,9 +313,12 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
             return json.dumps({"evidence": {"artifact_path": "arch_ok.txt"}, "invoked_mcps": ["codebase-memory"],
                                "skill_evidence": {"superpowers": {"command": "python check_arch.py", "exit_code": 0,
                                                                   "output_ref": r.stdout.strip()}}})
-        spec = SpecialistDefinition(name="Arch-Verifier", skill_packs=("superpowers",), skill_dirs=(str(pack.parent),),
-                                    mcp_servers=("codebase-memory",), disabled_mcp_servers=("github",),
-                                    strict_mcp_scope=True)
+        spec = SpecialistDefinition(name="Arch-Verifier", role_prompt="Verify architecture and boundaries.",
+                                    skill_packs=("superpowers",), disabled_skills=("legacy-skill",),
+                                    skill_dirs=(str(pack.parent),), mcp_servers=("codebase-memory",),
+                                    disabled_mcp_servers=("github",), strict_mcp_scope=True,
+                                    plugins=("omr-guard",), disabled_plugins=("noisy-plugin",),
+                                    allowed_tools=("read_file",), denied_tools=("rm",))
         rb = d.onboard_specialist("Arch-Verifier", [RouteTarget("Claude-Code", "Claude-Code", Stub("Claude-Code", claude)),
                                                     RouteTarget("Codex-CLI", "Codex-CLI", Stub("Codex-CLI", codex))],
                                   specialist_definition=spec, require_skill_evidence=True)
@@ -318,13 +330,19 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
         sdef = rb.specialist_definition
         sdir = Path(sdef.specialist_dir) if sdef.specialist_dir else None
         created = bool(sdir and (sdir / "AGENTS.md").is_file())
-        loaded = created and SpecialistDefinition.from_agents_md(sdir).resolved_slug == "arch-verifier"
+        fields = ("name", "resolved_slug", "role_prompt", "skill_packs", "disabled_skills", "mcp_servers",
+                  "disabled_mcp_servers", "strict_mcp_scope", "plugins", "disabled_plugins",
+                  "allowed_tools", "denied_tools")
+        loaded = SpecialistDefinition.from_agents_md(sdir) if created else None
+        loaded_ok = bool(created and all(getattr(loaded, f) == getattr(sdef, f) for f in fields))
         first_err = rb.last_attempts[0].get("error_class")
         chosen = str(rb.last_chosen_backend)
         clean = git(wt, "status", "--porcelain", "-uall") == "" and not (wt / "AGENTS.md").exists()
-        return {"ok": bool(created and loaded and seen.get("folder_ok") and first_err == "SkillContractViolationError"
-                           and chosen == "Codex-CLI" and clean),
-                "specialist_dir_created": created, "agents_md_loaded": bool(loaded), "first_attempt_error": first_err,
+        cf, xf = bool(seen.get("claude_flags_ok")), bool(seen.get("codex_flags_ok"))
+        return {"ok": bool(created and loaded_ok and cf and xf and seen.get("folder_ok")
+                           and first_err == "SkillContractViolationError" and chosen == "Codex-CLI" and clean),
+                "specialist_dir_created": created, "agents_md_loaded": loaded_ok, "claude_flags_ok": cf,
+                "codex_flags_ok": xf, "first_attempt_error": first_err,
                 "chosen_backend": chosen, "worktree_clean": clean}
     timed("W7_per_specialist_folder_agents_md_and_session_flag_failover", w7)
 

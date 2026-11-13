@@ -321,7 +321,8 @@ class TestOutsideInScope:
 
     def test_outside_in_per_specialist_folder_subprocess_and_skill_mcp_failover(self, tmp_path):
         repo = _init_repo(tmp_path)
-        wt = WorktreeManager().provision_worktree(repo, tmp_path / "wts", "run-spec-dir", "slice-1")
+        base = _git(repo, "rev-parse", "HEAD")
+        wt = WorktreeManager().provision_worktree(repo, tmp_path / "wts", "run-spec-dir", "slice-1", base)
         _git(wt, "config", "user.email", "t@example.com")
         _git(wt, "config", "user.name", "t")
         pack = tmp_path / "ext_skills" / "superpowers"
@@ -335,6 +336,8 @@ class TestOutsideInScope:
 
             async def run(self, task, **kw):
                 seen["claude_args"] = list(kw["session_cli_args"])
+                seen["stale_cleared"] = (not getattr(self, "last_skill_evidence", None)
+                                         and not getattr(self, "last_invoked_mcps", None))
                 return json.dumps({"invoked_mcps": [], "skill_evidence": {}})
 
         class _Copilot:
@@ -358,6 +361,8 @@ class TestOutsideInScope:
                 })
 
         flaky, good = _Claude(), _Copilot()
+        flaky.last_skill_evidence = {"superpowers": {"command": "stale", "exit_code": 0, "output_ref": "stale"}}
+        flaky.last_invoked_mcps = ("codebase-memory",)
         dispatcher = _dispatcher(tmp_path, wt, _Table({}))
         tdd_spec = dispatcher.onboard_specialist(
             "TDD-Implementer",
@@ -371,6 +376,7 @@ class TestOutsideInScope:
         asyncio.run(dispatcher.dispatch_specialist_node(
             "SPEC-DIR-1", "TDD-Implementer", "Implement feature with superpowers", workspace=wt, writes=True))
         assert "--add-dir" in seen["claude_args"] and "--strict-mcp-config" in seen["claude_args"]
+        assert seen["stale_cleared"] is True
         assert tdd_spec.last_attempts[0]["error_class"] == "SkillContractViolationError"
         assert tdd_spec.last_chosen_backend == "Copilot-CLI"
         assert seen["script"].is_file() and wt not in seen["script"].parents

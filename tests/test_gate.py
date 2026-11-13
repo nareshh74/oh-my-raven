@@ -9,6 +9,7 @@ from pathlib import Path
 from oh_my_raven.oh_my_raven import (
     OmrDispatcher,
     SessionHarnessFlagBuilder,
+    SkillContractViolationError,
     SpecialistDefinition,
     SpecialistFolderManager,
 )
@@ -289,6 +290,23 @@ def test_specialist_folder_manager_agents_md_roundtrip_and_layout(tmp_path):
         assert getattr(loaded, field) == getattr(mat, field), field
     assert loaded.role_prompt == "Follow strict TDD and clean architecture."
 
+    root = tmp_path / "specialists"
+    for bad in (SpecialistDefinition(name="Bad", slug="../escape"),
+                SpecialistDefinition(name="Bad2", skill_packs=("../escape",)),
+                SpecialistDefinition(name="Bad3", plugins=("a/b",))):
+        with pytest.raises(ValueError):
+            SpecialistFolderManager.ensure_specialist_dir(bad, root)
+
+    ext = tmp_path / "ext_skills"
+    plug_spec = dict(name="Recon", skill_packs=("superpowers", "ecc"), plugins=("omr-guard", "old-plug"))
+    SpecialistFolderManager.ensure_specialist_dir(SpecialistDefinition(**plug_spec), root, extra_skill_roots=[ext])
+    rf = root / "recon"
+    SpecialistFolderManager.ensure_specialist_dir(
+        SpecialistDefinition(**plug_spec, disabled_skills=("ecc",), disabled_plugins=("old-plug",)),
+        root, extra_skill_roots=[ext])
+    assert not (rf / "skills" / "ecc").exists()
+    assert not (rf / "plugins" / "old-plug").exists()
+
 
 def test_session_harness_flag_builder_all_four_harnesses(tmp_path):
     mat = _materialized_specialist(tmp_path)
@@ -302,6 +320,13 @@ def test_session_harness_flag_builder_all_four_harnesses(tmp_path):
     assert "-c" in codex and any(a.startswith("skills.dirs=") for a in codex)
     assert "mcp_servers.codebase-memory.enabled=true" in codex and "mcp_servers.github.enabled=false" in codex
     assert "--enable" in codex and "--disable" in codex
+    assert "mcp_servers._strict_scope=true" in codex
+    for prefix in ("tools.allowed=", "tools.denied=", "skills.disabled="):
+        assert any(a.startswith(prefix) for a in codex), prefix
+    for flag in ("--strict-mcp-scope", "--disable-mcp", "--deny-tools", "--disable-skills"):
+        assert flag in args["Hermes-CLI"], flag
+    with pytest.raises(SkillContractViolationError):
+        SessionHarnessFlagBuilder.build_for_candidate(mat, "Unknown-Generic-Harness")
     for flag in ("--add-dir", "--disable-builtin-mcps", "--additional-mcp-config", "--enable-mcp-server",
                  "--disable-mcp-server", "--plugin-dir", "--available-tools", "--excluded-tools"):
         assert flag in args["Copilot-CLI"], flag

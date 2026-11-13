@@ -12,7 +12,9 @@ from dogfood_omr_workload_experiment import run_dogfood_experiment  # noqa: E402
 
 def _check(s, tmp_path):
     assert len(s["workloads"]) == 7
-    assert s["workloads"]["W7_per_specialist_folder_agents_md_and_session_flag_failover"]["ok"]
+    w7 = s["workloads"]["W7_per_specialist_folder_agents_md_and_session_flag_failover"]
+    for k in ("ok", "claude_flags_ok", "codex_flags_ok", "agents_md_loaded", "worktree_clean"):
+        assert w7[k], k
     assert all(w["ok"] for w in s["workloads"].values()), s["workloads"]
     assert s["all_ok"]
     n = s["spans_by_name"]
