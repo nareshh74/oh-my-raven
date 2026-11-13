@@ -66,36 +66,23 @@ class _Provider(otel_trace.TracerProvider):
         return _Tracer(self.sink)
 
 
-_CAPTURE: tuple[Any, str] | None = None
+@contextlib.contextmanager
+def capture_spans():
+    """Bind owned tracers to gate/routing so capture is independent of the global OTel provider."""
+    from oh_my_raven import gate, routing as routing_mod
 
-
-def install_span_capture() -> tuple[Any, str]:
-    """Install once per process (OTel allows a single global provider)."""
-    global _CAPTURE
-    if _CAPTURE:
-        return _CAPTURE
+    sink: list = []
+    tracer = _Provider(sink).get_tracer("oh_my_raven")
+    saved = (gate._TRACER, routing_mod._TRACER)
+    gate._TRACER = routing_mod._TRACER = tracer
     try:
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-
-        exporter = InMemorySpanExporter()
-        provider = TracerProvider()
-        provider.add_span_processor(SimpleSpanProcessor(exporter))
-        otel_trace.set_tracer_provider(provider)
-        _CAPTURE = (exporter, "opentelemetry-sdk InMemorySpanExporter")
-    except ImportError:
-        sink: list = []
-        otel_trace.set_tracer_provider(_Provider(sink))
-        _CAPTURE = (sink, "custom recording TracerProvider (opentelemetry-sdk not installed)")
-    return _CAPTURE
+        yield sink
+    finally:
+        gate._TRACER, routing_mod._TRACER = saved
 
 
-def _span_rows(cap) -> list[dict[str, Any]]:
-    if isinstance(cap, list):
-        return [{"name": s.name, "attributes": dict(s.attributes), "events": list(s.events)} for s in cap]
-    return [{"name": s.name, "attributes": dict(s.attributes or {}),
-             "events": [{"name": e.name, **dict(e.attributes or {})} for e in s.events]} for s in cap.get_finished_spans()]
+def _span_rows(sink: list) -> list[dict[str, Any]]:
+    return [{"name": s.name, "attributes": dict(s.attributes), "events": list(s.events)} for s in sink]
 
 
 # ---------------------------------------------------------------- helpers
@@ -130,16 +117,16 @@ class Stub:
 
 class Table:
     def __init__(self) -> None:
-        self.backends: dict[str, Any] = {}
+        self._b: dict[str, Any] = {}
 
     def enabled(self):
         return [SimpleNamespace(name="Manager", description="lead", is_harness=False, kind="specialist")]
 
     def backend(self, name, build=None):
-        return self.backends.get(name)
+        return self._b.get(name)
 
-    def onboard(self, name: str, backend: Any) -> None:  # hot-onboard at runtime
-        self.backends[name] = backend
+    def onboard(self, name: str, backend: Any) -> None:
+        self._b[name] = backend
 
 
 class Inst:
@@ -167,9 +154,13 @@ def _wt(repo: Path, tmp: Path, run: str) -> Path:
 
 # ---------------------------------------------------------------- experiment
 def run_dogfood_experiment(tmp: Path) -> dict[str, Any]:
-    tmp = Path(tmp)
-    cap, cap_kind = install_span_capture()
-    span_base = len(_span_rows(cap))
+    with capture_spans() as sink:
+        summary = _run(Path(tmp), sink)
+    return summary
+
+
+def _run(tmp: Path, cap: list) -> dict[str, Any]:
+    cap_kind = "owned recording tracer bound to oh_my_raven.gate/routing"
     repo = init_repo(tmp)
     telemetry = tmp / "specialist_telemetry.jsonl"
     table = Table()
@@ -258,9 +249,10 @@ def run_dogfood_experiment(tmp: Path) -> dict[str, Any]:
             git(wt, "commit", "-q", "-m", "security audit")
             return json.dumps({"evidence": {"receipt_path": "audit_receipt.json"}})
         claude = Stub("Claude-Code", crash)
-        windsurf_h = Stub("Windsurf-ACP", windsurf)  # hot-onboarded 6th harness
-        auditor = routing("Security-Auditor", claude, [claude, windsurf_h], telemetry, max_attempts=4)  # hot-onboarded 8th specialist
-        table.onboard("Security-Auditor", auditor)
+        windsurf_h = Stub("Windsurf-ACP", windsurf)
+        auditor = d.onboard_specialist("Security-Auditor", [RouteTarget("Claude-Code", "Claude-Code", claude)],
+                                       max_failovers=2, max_attempts=3)
+        d.onboard_harness("Windsurf-ACP", windsurf_h, weight=1.0, max_failovers=2)
         d.workdir = wt
         try:
             asyncio.run(d.dispatch_specialist_node("W5", "Security-Auditor", "audit dependencies", workspace=wt, writes=True))
@@ -270,9 +262,12 @@ def run_dogfood_experiment(tmp: Path) -> dict[str, Any]:
         committed = "audit.txt" in git(wt, "show", "--name-only", "HEAD")
         status = d.queue.latest_by_task()["W5"].status
         chosen = str(auditor.last_chosen_backend)
-        return {"ok": status == "completed" and committed and statuses.count("failed") >= 2 and chosen == "Windsurf-ACP",
+        glog = json.loads((d.gate_log_path).read_text(encoding="utf-8"))
+        blob = json.dumps(glog)
+        onboarded = "onboard_specialist:Security-Auditor" in blob and "onboard_harness:Windsurf-ACP" in blob
+        return {"ok": onboarded and status == "completed" and committed and statuses.count("failed") >= 1 and chosen == "Windsurf-ACP",
                 "attempts": statuses, "claude_calls": claude.calls, "chosen_backend": chosen,
-                "committed": committed, "status": status}
+                "committed": committed, "status": status, "onboard_logged": onboarded}
     timed("W5_crash_revival_failover_hot_onboard", w5)
 
     def w6():
@@ -285,7 +280,7 @@ def run_dogfood_experiment(tmp: Path) -> dict[str, Any]:
         return {"ok": blocked and not pushed, "blocked": blocked, "callback_ran": bool(pushed)}
     timed("W6_irreversible_action_blocked", w6)
 
-    spans = _span_rows(cap)[span_base:]
+    spans = _span_rows(cap)
     by_name = Counter(s["name"] for s in spans)
     attempt_events = sum(1 for s in spans for e in s["events"] if e["name"] == "omr.routing.attempt")
     gate_log = json.loads((tmp / "runs" / "gate_log.json").read_text(encoding="utf-8"))
