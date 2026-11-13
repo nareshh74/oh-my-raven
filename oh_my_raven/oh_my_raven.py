@@ -2326,11 +2326,29 @@ class OmrDispatcher:
         targets: list[RouteTarget] | Any,
         max_failovers: int = 2,
         max_attempts: int | None = None,
+        replace: bool = False,
     ) -> RoutingBackend:
         """Register a profile-free specialist over an existing runtime harness pool."""
         route_targets = list(targets) if isinstance(targets, (list, tuple)) else [RouteTarget(name, name, targets)]
         if not route_targets:
             raise ValueError("A dynamic specialist requires at least one harness target")
+        existing = None
+        for attr in ("_backends", "_b"):
+            registered = getattr(self.table, attr, None)
+            if isinstance(registered, dict) and isinstance(registered.get(name), RoutingBackend):
+                existing = registered[name]
+                break
+        if existing is None:
+            getter = getattr(self.table, "get_backend", None)
+            if callable(getter):
+                candidate = getter(name)
+                if isinstance(candidate, RoutingBackend):
+                    existing = candidate
+        if existing is not None and not replace:
+            target_names = {target.name for target in existing._targets}
+            existing._targets.extend(target for target in route_targets if target.name not in target_names)
+            self.decide_gate("technical_decision", f"onboard_specialist:{name}")
+            return existing
         instances = next(
             (routed._instances for routed in getattr(self.table, "_backends", {}).values() if isinstance(routed, RoutingBackend)),
             None,
@@ -2421,12 +2439,14 @@ class OmrDispatcher:
         try:
             result = await self.dispatch_specialist_node(task_id, chosen, prompt)
             if self.completion_status(str(result)) == "completed":
-                return result
+                return {"status": "completed", "triage_tier": "trivial", "escalated": False, "result": result}
         except BaseException:
             pass
         decision = escalate_triage_tier("trivial", "trivial specialist run failed or was incomplete")
         self.decide_gate("technical_decision", f"triage_escalation:trivial->{decision.tier}")
-        return await self.submit_task(task_id, prompt, lead_specialist=chosen)
+        result = await self.submit_task(task_id, prompt, lead_specialist=chosen)
+        status = self.queue.latest_by_task()[task_id].status
+        return {"status": status, "triage_tier": decision.tier, "escalated": True, "result": result}
 
     def completion_status(self, result: str) -> QueueStatus:
         """Return completed only when result contains evidence we can verify."""
