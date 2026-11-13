@@ -318,6 +318,29 @@ SkillPackInjector = SkillPackResolver
 
 class SpecialistFolderManager:
     @staticmethod
+    def _validate_safe_component(value: str, label: str) -> str:
+        cleaned = value.strip()
+        if (
+            not cleaned
+            or cleaned in (".", "..")
+            or "/" in cleaned
+            or "\\" in cleaned
+            or ":" in cleaned
+            or Path(cleaned).is_absolute()
+            or any(part in ("", ".", "..") for part in Path(cleaned).parts)
+        ):
+            raise ValueError(f"Unsafe specialist {label} path component: {value!r}")
+        return cleaned
+
+    @staticmethod
+    def _ensure_within(root: Path, target: Path, label: str) -> Path:
+        try:
+            target.parent.resolve().relative_to(root.resolve())
+        except ValueError as exc:
+            raise ValueError(f"{label} escapes root {root}: {target}") from exc
+        return target
+
+    @staticmethod
     def _find(root: Path, name: str) -> Path | None:
         for candidate in (root / name, root / name.lower()):
             if candidate.is_dir() and ((candidate / "SKILL.md").is_file() or any(candidate.iterdir())):
@@ -328,9 +351,28 @@ class SpecialistFolderManager:
 
     @classmethod
     def ensure_specialist_dir(cls, specialist: SpecialistDefinition | Any, specialists_root: Path | str, *, extra_skill_roots: Sequence[str | Path] = (), extra_plugin_roots: Sequence[str | Path] = ()) -> SpecialistDefinition:
-        spec = SpecialistDefinition.from_obj(specialist); spec_dir = Path(specialists_root).expanduser().resolve() / spec.resolved_slug
+        spec = SpecialistDefinition.from_obj(specialist)
+        if spec.slug.strip(): cls._validate_safe_component(spec.slug, "slug")
+        slug = cls._validate_safe_component(spec.resolved_slug, "slug")
+        skill_packs = tuple(cls._validate_safe_component(p, "skill_pack") for p in spec.skill_packs)
+        disabled_skills = tuple(cls._validate_safe_component(p, "skill_pack") for p in spec.disabled_skills)
+        plugins = tuple(cls._validate_safe_component(p, "plugin") for p in spec.plugins)
+        disabled_plugins = tuple(cls._validate_safe_component(p, "plugin") for p in spec.disabled_plugins)
+        root_resolved = Path(specialists_root).expanduser().resolve()
+        spec_dir = cls._ensure_within(root_resolved, root_resolved / slug, "specialist_dir")
         skills_dir, plugins_dir = spec_dir / "skills", spec_dir / "plugins"
         skills_dir.mkdir(parents=True, exist_ok=True); plugins_dir.mkdir(parents=True, exist_ok=True)
+        def remove_entry(entry: Path) -> None:
+            if entry.is_symlink(): entry.unlink()
+            elif os.name == "nt" and entry.is_dir() and entry.stat().st_file_attributes & 0x400: os.rmdir(entry)
+            elif entry.is_dir(): shutil.rmtree(entry)
+            else: entry.unlink()
+        active_skills = {p for p in skill_packs if p not in disabled_skills}
+        active_plugins = {p for p in plugins if p not in disabled_plugins}
+        for entry in skills_dir.iterdir():
+            if entry.name not in active_skills: remove_entry(entry)
+        for entry in plugins_dir.iterdir():
+            if entry.name not in active_plugins: remove_entry(entry)
         def materialize(src: Path | None, dst: Path) -> None:
             if dst.exists() or dst.is_symlink(): return
             if src and src.resolve() != dst.resolve():
@@ -340,13 +382,13 @@ class SpecialistFolderManager:
                     shutil.copytree(src, dst, dirs_exist_ok=True); return
             dst.mkdir(parents=True, exist_ok=True)
         roots = tuple(Path(p).expanduser() for p in (*spec.skill_dirs, *extra_skill_roots)) + SkillPackResolver.DEFAULT_SKILL_SEARCH_ROOTS
-        for pack in spec.skill_packs:
-            if pack in spec.disabled_skills: continue
+        for pack in skill_packs:
+            if pack in disabled_skills: continue
             src = next((found for root in roots if (found := cls._find(root, pack))), None); target = skills_dir / pack
             materialize(src, target)
             if not (target / "SKILL.md").is_file(): (target / "SKILL.md").write_text(SkillPackResolver.resolve_skill_pack_text(pack, extra_dirs=spec.skill_dirs), encoding="utf-8")
-        for plugin in spec.plugins:
-            if plugin in spec.disabled_plugins: continue
+        for plugin in plugins:
+            if plugin in disabled_plugins: continue
             src = next((p / plugin for p in map(Path, extra_plugin_roots) if (p / plugin).is_dir()), None); target = plugins_dir / plugin
             materialize(src, target)
             if not any(target.iterdir()): (target / "plugin.json").write_text(json.dumps({"name": plugin, "enabled": True}, indent=2), encoding="utf-8")
@@ -373,12 +415,17 @@ class SessionHarnessFlagBuilder:
             if mcp and (am or s.strict_mcp_scope): a += ["--mcp-config", mcp]
             for p in ap: a += ["--plugin-dir", str(d / "plugins" / p) if d else p]
             if s.allowed_tools: a += ["--allowedTools", ",".join(s.allowed_tools)]
-            dis=list(s.denied_tools)+[f"mcp__{m}__*" for m in dm]
+            dis=list(s.denied_tools)+[f"mcp__{m}__*" for m in dm]+[f"Skill({sk})" for sk in s.disabled_skills]
             if dis: a += ["--disallowedTools", ",".join(dis)]
+            if dp: a += ["--disable-plugin", ",".join(dp)]
         elif family == "codex":
             if skills: a += ["-c", f'skills.dirs=["{skills.replace(chr(92), "/")}"]']
+            if s.strict_mcp_scope: a += ["-c", "mcp_servers._strict_scope=true"]
             for m in am: a += ["-c", f"mcp_servers.{m}.enabled=true"]
             for m in dm: a += ["-c", f"mcp_servers.{m}.enabled=false"]
+            if s.disabled_skills: a += ["-c", f"skills.disabled={json.dumps(list(s.disabled_skills))}"]
+            if s.allowed_tools: a += ["-c", f"tools.allowed={json.dumps(list(s.allowed_tools))}"]
+            if s.denied_tools: a += ["-c", f"tools.denied={json.dumps(list(s.denied_tools))}"]
             for p in ap: a += ["--enable", p]
             for p in dp: a += ["--disable", p]
         elif family == "copilot":
@@ -389,13 +436,20 @@ class SessionHarnessFlagBuilder:
             for m in dm: a += ["--disable-mcp-server", m]
             for p in ap: a += ["--plugin-dir", str(d / "plugins" / p) if d else p]
             if s.allowed_tools: a += ["--available-tools", ",".join(s.allowed_tools)]
-            if s.denied_tools: a += ["--excluded-tools", ",".join(s.denied_tools)]
+            excluded=list(s.denied_tools)+[f"mcp__{m}__*" for m in dm]+[f"Skill({sk})" for sk in s.disabled_skills]+[f"Plugin({p})" for p in dp]
+            if excluded: a += ["--excluded-tools", ",".join(excluded)]
         elif family == "hermes":
             if ask: a += ["-s", ",".join(ask)]
             tools=list(s.allowed_tools)+[m if m.startswith("mcp-") else "mcp-"+m for m in am]
             if tools: a += ["-t", ",".join(tools)]
             if dp: a += ["--safe-mode"]
+            if s.strict_mcp_scope: a += ["--strict-mcp-scope"]
+            if dm: a += ["--disable-mcp", ",".join(dm)]
+            if s.denied_tools: a += ["--deny-tools", ",".join(s.denied_tools)]
+            if s.disabled_skills: a += ["--disable-skills", ",".join(s.disabled_skills)]
         else:
+            if (s.strict_mcp_scope or dm or dp or s.denied_tools or s.disabled_skills) and not getattr(backend, "supports_session_isolation", False):
+                raise SkillContractViolationError(f"Harness {harness_name!r} (generic) cannot enforce requested specialist isolation policy")
             if d: a += ["--add-dir", str(d)]
             if mcp and am: a += ["--mcp-config", mcp]
         return {"harness_family":family,"specialist_dir":str(d) if d else "","agents_md_path":agents,"session_mcp_config":mcp,"session_cli_args":tuple(a),"mcps_enabled":tuple(am),"mcps_disabled":tuple(dm),"plugins_enabled":tuple(ap),"plugins_disabled":tuple(dp),"skills_enabled":tuple(ask),"skills_disabled":tuple(s.disabled_skills)}
