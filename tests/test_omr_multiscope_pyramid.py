@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from oh_my_raven.oh_my_raven import DynamicDecompositionGate, OmrDispatcher, OmrTaskQueue, WorktreeManager, escalate_triage_tier
+from oh_my_raven.oh_my_raven import DynamicDecompositionGate, OmrDispatcher, OmrTaskQueue, WorktreeManager
 from raven.agent.subagent.prompt_errors import DagValidationError
 from oh_my_raven.routing import DEFAULT_MAX_ATTEMPTS, RouteTarget, RoutingBackend
 
@@ -341,6 +341,12 @@ class TestOutsideInScope:
         result = asyncio.run(dispatcher.dispatch_specialist_node("HOT-S", "Security-Auditor", "audit", writes=True))
         assert security.last_chosen_backend == "Windsurf-ACP"
         assert dispatcher.completion_status(result) == "completed"
+        duplicate = dispatcher.onboard_specialist(
+            "Security-Auditor", [RouteTarget("Windsurf-ACP", "duplicate", windsurf_harness),
+                                 RouteTarget("Second-Harness", "new", windsurf_harness)]
+        )
+        assert duplicate is security
+        assert [target.name for target in security._targets] == ["Windsurf-ACP", "Second-Harness"]
         assert dispatcher.queue.latest_by_task()["HOT-S"].status == "completed"
         assert not (tmp_path / "profiles" / "Security-Auditor").exists()
         assert {row["status"] for row in _ledger(tmp_path) if row["task_id"] == "HOT-S"} >= {"routed", "running", "completed"}
@@ -391,10 +397,20 @@ class TestEndToEndGoldenSet:
 
         # 1: trivial work takes the one-node fast path without CTO/Manager DAG ceremony.
         repo1 = _init_repo(tmp_path / "s1")
-        fast = _Worker(repo1, _write_deliverable)
-        d1 = _dispatcher(tmp_path / "s1", repo1, _Table({"Worker": _routing("Worker", fast)}))
-        asyncio.run(d1.submit_trivial_task("T1", "fix typo in config.yaml", "Worker"))
-        scores["s1"] = d1.triage_task("fix typo in config.yaml", 1).tier == "trivial" and fast.output is _write_deliverable
+        def write_config(repo: Path) -> str:
+            (repo / "cfg.txt").write_text("timeout=30\n", encoding="utf-8")
+            return json.dumps({"artifact_path": "cfg.txt"})
+
+        fast = _Worker(repo1, write_config)
+        d1 = _dispatcher(tmp_path / "s1", repo1, _Table({"backend-developer": _routing("backend-developer", fast)}))
+        trivial_res = asyncio.run(d1.submit_trivial_task("golden-s1", "Update timeout in config.yaml", "backend-developer"))
+        trivial_entry = d1.queue.latest_by_task()["golden-s1"]
+        scores["s1"] = (trivial_res["status"] == "completed"
+                        and trivial_res["triage_tier"] == "trivial"
+                        and trivial_res.get("escalated") is False
+                        and (repo1 / "cfg.txt").is_file()
+                        and trivial_entry.status == "completed"
+                        and trivial_entry.assigned_specialist == "backend-developer")
 
         # 2: council disagreement exposes and persists plan gaps.
         council = d1.run_council_consensus("C1", [
@@ -466,9 +482,31 @@ class TestEndToEndGoldenSet:
         scores["s8"] = (primary.calls == DEFAULT_MAX_ATTEMPTS and d8.completion_status(out8a) == "completed"
                         and len(rb8.last_attempts) == 5 and d8.completion_status(out8b) == "completed")
 
-        # 9: rigor matches complexity; failed trivial work auto-escalates to a standard DAG.
-        scores["s9"] = (d1.triage_task("fix typo", 1).tier == "trivial"
-                        and escalate_triage_tier("trivial", "incomplete").tier == "standard")
+        # 9: incomplete trivial work auto-escalates through standard DAG orchestration.
+        repo9 = _init_repo(tmp_path / "s9")
+
+        class IncompleteThenManager(_Manager):
+            name = "backend-developer"
+            def __init__(self): self.calls = 0
+            async def run(self, task, **kw):
+                self.calls += 1
+                return "Needs full multi-node architecture" if self.calls == 1 else _dag_payload()
+
+        def write_standard(repo: Path) -> str:
+            (repo / "s9_standard.txt").write_text("standard path\n", encoding="utf-8")
+            return json.dumps({"artifact_path": "s9_standard.txt"})
+
+        d9 = _dispatcher(tmp_path / "s9", repo9, _Table({
+            "backend-developer": _routing("backend-developer", IncompleteThenManager()),
+            "Worker": _routing("Worker", _Worker(repo9, write_standard)),
+            "CTO": _routing("CTO", _Cto()),
+            "Reviewer": _routing("Reviewer", _Reviewer(repo9)),
+        }))
+        s9_result = asyncio.run(d9.submit_trivial_task("golden-s9", "Design and implement architecture", "backend-developer"))
+        scores["s9"] = (s9_result["triage_tier"] == "standard"
+                        and s9_result["escalated"] is True
+                        and s9_result["status"] == "completed"
+                        and (repo9 / "s9_standard.txt").is_file())
 
         # 10: first failure becomes an active lesson injected into the next prompt.
         class Learner:
