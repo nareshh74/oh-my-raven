@@ -7,6 +7,12 @@ from oh_my_raven.gate import CouncilVote, LessonsStore, GatePolicy, classify_tri
 from pathlib import Path
 
 from oh_my_raven.oh_my_raven import (
+    BUCKET1_STARTUP_MCPS,
+    BUCKET1_STARTUP_SKILLS,
+    BUCKET2_SPECIALIST_FAMILIES,
+    HarnessStartupContractViolationError,
+    HarnessStartupManager,
+    HarnessStartupReceipt,
     OmrDispatcher,
     SessionHarnessFlagBuilder,
     SkillContractViolationError,
@@ -332,3 +338,37 @@ def test_session_harness_flag_builder_all_four_harnesses(tmp_path):
         assert flag in args["Copilot-CLI"], flag
     for flag in ("-s", "-t", "--safe-mode"):
         assert flag in args["Hermes-CLI"], flag
+
+
+def test_bucket1_harness_onboarding_probe_and_bucket2_gstack_separation(tmp_path):
+    assert "gstack" in BUCKET2_SPECIALIST_FAMILIES and "gstack" not in BUCKET1_STARTUP_SKILLS
+    assert "andrej-karpathy-skill" in BUCKET1_STARTUP_SKILLS and "autonomous-delivery" in BUCKET1_STARTUP_SKILLS
+    root = tmp_path / "harnesses"
+    with pytest.raises(HarnessStartupContractViolationError):
+        HarnessStartupManager.ensure_and_verify_harness("Claude-Code", root, auto_install=False)
+    receipt = HarnessStartupManager.ensure_and_verify_harness("Claude-Code", root, auto_install=True)
+    assert isinstance(receipt, HarnessStartupReceipt) and receipt.ready is True
+    home = Path(receipt.harness_home)
+    for s in BUCKET1_STARTUP_SKILLS:
+        assert (home / "skills" / s / "SKILL.md").is_file(), s
+    assert set(BUCKET1_STARTUP_MCPS) <= set(receipt.installed_mcps)
+    assert (home / "startup_manifest.json").is_file()
+
+    spec = SpecialistDefinition(name="CTO", skill_packs=("gstack", "andrej-karpathy-skill"),
+                                startup_skills=("andrej-karpathy-skill", "autonomous-delivery"),
+                                startup_mcp_servers=("everos", "trail"))
+    mat = SpecialistFolderManager.ensure_specialist_dir(spec, tmp_path / "specialists",
+                                                        extra_skill_roots=[tmp_path / "ext"])
+    sdir = Path(mat.specialist_dir)
+    assert (sdir / "skills" / "gstack" / "SKILL.md").is_file()
+    assert not (sdir / "skills" / "andrej-karpathy-skill").exists()
+    loaded = SpecialistDefinition.from_agents_md(sdir)
+    assert loaded.startup_skills == spec.startup_skills
+    assert loaded.startup_mcp_servers == spec.startup_mcp_servers
+
+
+def test_reconcile_harness_pool_eliminates_bucket1_drift(tmp_path):
+    names = ["Claude-Code", "Codex-CLI", "Copilot-CLI", "Hermes-CLI"]
+    res = HarnessStartupManager.reconcile_harness_pool(names, tmp_path / "harnesses")
+    assert res["in_sync"] is True
+    assert set(BUCKET1_STARTUP_SKILLS) <= set(res["skills_intersection"])

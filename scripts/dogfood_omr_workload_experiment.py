@@ -314,13 +314,18 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
                                "skill_evidence": {"superpowers": {"command": "python check_arch.py", "exit_code": 0,
                                                                   "output_ref": r.stdout.strip()}}})
         spec = SpecialistDefinition(name="Arch-Verifier", role_prompt="Verify architecture and boundaries.",
-                                    skill_packs=("superpowers",), disabled_skills=("legacy-skill",),
+                                    skill_packs=("superpowers", "gstack"), disabled_skills=("legacy-skill",),
+                                    startup_skills=("andrej-karpathy-skill", "autonomous-delivery"),
                                     skill_dirs=(str(pack.parent),), mcp_servers=("codebase-memory",),
                                     disabled_mcp_servers=("github",), strict_mcp_scope=True,
                                     plugins=("omr-guard",), disabled_plugins=("noisy-plugin",),
                                     allowed_tools=("read_file",), denied_tools=("rm",))
-        rb = d.onboard_specialist("Arch-Verifier", [RouteTarget("Claude-Code", "Claude-Code", Stub("Claude-Code", claude)),
-                                                    RouteTarget("Codex-CLI", "Codex-CLI", Stub("Codex-CLI", codex))],
+        claude_b, codex_b = Stub("Claude-Code", claude), Stub("Codex-CLI", codex)
+        d.onboard_harness("Claude-Code", claude_b)
+        d.onboard_harness("Codex-CLI", codex_b)
+        reconciled = d.reconcile_harnesses()
+        rb = d.onboard_specialist("Arch-Verifier", [RouteTarget("Claude-Code", "Claude-Code", claude_b),
+                                                    RouteTarget("Codex-CLI", "Codex-CLI", codex_b)],
                                   specialist_definition=spec, require_skill_evidence=True)
         d.workdir = wt
         try:
@@ -339,8 +344,14 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
         chosen = str(rb.last_chosen_backend)
         clean = git(wt, "status", "--porcelain", "-uall") == "" and not (wt / "AGENTS.md").exists()
         cf, xf = bool(seen.get("claude_flags_ok")), bool(seen.get("codex_flags_ok"))
-        return {"ok": bool(created and loaded_ok and cf and xf and seen.get("folder_ok")
+        b1 = bool(reconciled["in_sync"])
+        gs = bool(sdir and (sdir / "skills" / "gstack" / "SKILL.md").is_file()
+                  and (sdir / "skills" / "superpowers" / "SKILL.md").is_file()
+                  and not (sdir / "skills" / "andrej-karpathy-skill").exists()
+                  and (Path(claude_b.harness_home) / "skills" / "andrej-karpathy-skill" / "SKILL.md").is_file())
+        return {"ok": bool(created and loaded_ok and cf and xf and seen.get("folder_ok") and b1 and gs
                            and first_err == "SkillContractViolationError" and chosen == "Codex-CLI" and clean),
+                "bucket1_reconciled": b1, "gstack_in_bucket2": gs,
                 "specialist_dir_created": created, "agents_md_loaded": loaded_ok, "claude_flags_ok": cf,
                 "codex_flags_ok": xf, "first_attempt_error": first_err,
                 "chosen_backend": chosen, "worktree_clean": clean}

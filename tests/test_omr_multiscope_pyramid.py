@@ -370,9 +370,14 @@ class TestOutsideInScope:
             specialist_definition={"name": "TDD-Implementer", "role_prompt": "Strict TDD specialist.",
                                    "skill_packs": ["superpowers"], "skill_dirs": [str(pack.parent)],
                                    "mcp_servers": ["codebase-memory"], "disabled_mcp_servers": ["github"],
-                                   "strict_mcp_scope": True},
+                                   "strict_mcp_scope": True,
+                                   "startup_skills": ["andrej-karpathy-skill", "autonomous-delivery"],
+                                   "startup_mcp_servers": ["everos"]},
             require_skill_evidence=True,
         )
+        sdir = Path(tdd_spec.specialist_definition.specialist_dir)
+        assert not (sdir / "skills" / "andrej-karpathy-skill").exists()
+        assert (sdir / "skills" / "superpowers" / "SKILL.md").is_file()
         asyncio.run(dispatcher.dispatch_specialist_node(
             "SPEC-DIR-1", "TDD-Implementer", "Implement feature with superpowers", workspace=wt, writes=True))
         assert "--add-dir" in seen["claude_args"] and "--strict-mcp-config" in seen["claude_args"]
