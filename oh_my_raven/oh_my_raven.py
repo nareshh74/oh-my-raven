@@ -30,6 +30,71 @@ BUCKET1_STARTUP_MCPS: tuple[str, ...] = ("everos", "trail", "codebase-memory", "
 BUCKET1_STARTUP_PLUGINS: tuple[str, ...] = ("context-mode", "token-optimizer", "codeburn-startup", "repo-context-hook", "everos")
 BUCKET2_SPECIALIST_FAMILIES: tuple[str, ...] = ("gstack", "superpowers", "ecc", "mattpocock", "agent-skills", "pstack", "open-code-review")
 
+def infer_model_family(model_id: str) -> str:
+    token = str(model_id or "").strip().lower()
+    for prefix in ("custom/gh/", "custom/ghe-copilot/", "gh/", "ghe-copilot/", "anthropic/", "openai/", "google/", "openrouter/", "copilot/", "xai/", "meta/", "deepseek/", "mistral/", "qwen/"):
+        if token.startswith(prefix): token = token[len(prefix):]; break
+    for family, needles in (("claude", ("claude", "sonnet", "opus", "haiku")), ("gpt", ("gpt-", "gpt4", "gpt5", "gpt6", "o1", "o3", "o4", "codex")), ("gemini", ("gemini",)), ("grok", ("grok",)), ("deepseek", ("deepseek",)), ("llama", ("llama",)), ("qwen", ("qwen",)), ("mistral", ("mistral", "codestral"))):
+        if any(n in token for n in needles): return family
+    return re.split(r"[-_/:.]", token)[0] if token else ""
+
+@dataclass(frozen=True)
+class SpecialistModelConfig:
+    preferred_models: tuple[str, ...] = (); fallback_models: tuple[str, ...] = (); model_tier: str = ""; reasoning_effort: str = ""; disallowed_models: tuple[str, ...] = (); require_distinct_model_family_from_author: bool = False
+    model_aliases: dict[str, dict[str, str]] = field(default_factory=dict)
+    @property
+    def is_configured(self) -> bool: return any((self.preferred_models, self.fallback_models, self.model_tier, self.reasoning_effort, self.disallowed_models, self.require_distinct_model_family_from_author, self.model_aliases))
+    @property
+    def candidate_models(self) -> tuple[str, ...]: return tuple(dict.fromkeys(self.preferred_models + self.fallback_models))
+    @classmethod
+    def from_obj(cls, obj: Any) -> "SpecialistModelConfig":
+        if obj is None: return cls()
+        if isinstance(obj, cls): return obj
+        read = obj.get if isinstance(obj, dict) else lambda k, d=None: getattr(obj, k, d)
+        def get(s: str, c: str, d: Any = None) -> Any:
+            value = read(s, None); return read(c, d) if value is None else value
+        effort = str(get("reasoning_effort", "reasoningEffort", "") or "").lower()
+        if effort and effort not in ("low", "medium", "high", "max"): raise ValueError(f"invalid reasoning_effort: {effort!r}")
+        return cls(tuple(map(str, get("preferred_models", "preferredModels", ()) or ())), tuple(map(str, get("fallback_models", "fallbackModels", ()) or ())), str(get("model_tier", "modelTier", "") or ""), effort, tuple(map(str, get("disallowed_models", "disallowedModels", ()) or ())), bool(get("require_distinct_model_family_from_author", "requireDistinctModelFamilyFromAuthor", False)), dict(get("model_aliases", "modelAliases", {}) or {}))
+    def to_dict(self) -> dict[str, Any]: return {"preferred_models": list(self.preferred_models), "fallback_models": list(self.fallback_models), "model_tier": self.model_tier, "reasoning_effort": self.reasoning_effort, "disallowed_models": list(self.disallowed_models), "require_distinct_model_family_from_author": self.require_distinct_model_family_from_author, "model_aliases": self.model_aliases}
+    def is_model_disallowed(self, model_id: str, *, author_models: Sequence[str] = (), author_families: Sequence[str] = (), excluded_models: Sequence[str] = ()) -> tuple[bool, str]:
+        model = str(model_id or "").strip().lower(); family = infer_model_family(model)
+        if model in {str(m).lower().strip() for m in excluded_models if m}: return True, f"excluded_model:{model_id}"
+        for pattern in self.disallowed_models:
+            pat = str(pattern).strip().lower()
+            if (pat.startswith("family:") and family == pat[7:]) or fnmatch.fnmatchcase(model, pat): return True, f"disallowed_model:{pattern}"
+        families = {infer_model_family(m) for m in author_models if m} | {str(f).lower().strip() for f in author_families if f}
+        if self.require_distinct_model_family_from_author and (model in {str(m).lower().strip() for m in author_models} or (family and family in families)): return True, f"author_family_conflict:{family}"
+        return False, ""
+    def resolve_dialect_model(self, canonical_model: str, harness_name: str, harness_family: str = "") -> str:
+        direct = self.model_aliases.get(canonical_model)
+        if isinstance(direct, str): return direct
+        if isinstance(direct, dict):
+            for key in (harness_name, harness_name.lower(), harness_family, harness_family.lower(), "default"):
+                if isinstance(direct.get(key), str): return direct[key]
+        for key in (harness_name, harness_name.lower(), harness_family, harness_family.lower()):
+            reverse = self.model_aliases.get(key)
+            if isinstance(reverse, dict) and isinstance(reverse.get(canonical_model), str): return reverse[canonical_model]
+        return canonical_model
+    def resolve_for_candidate(self, harness_name: str, *, harness_family: str = "", supported_models: Sequence[str] = (), default_model: str = "", author_models: Sequence[str] = (), author_families: Sequence[str] = (), excluded_models: Sequence[str] = ()) -> dict[str, Any]:
+        rejections: list[str] = []
+        def out(c: str = "", d: str = "", source: str = "none", ok: bool = False, fallback: bool = False) -> dict[str, Any]:
+            parts = (d or c).split("/"); provider = "/".join(parts[:2]) if parts[:1] == ["custom"] and len(parts) > 2 else (parts[0] if len(parts) > 1 else (harness_family or harness_name))
+            return {"canonical_model": c, "dialect_model": d, "provider": provider if c else "", "model_family": infer_model_family(c) or infer_model_family(d), "reasoning_effort": self.reasoning_effort, "resolution_source": source, "fallback_used": fallback, "compatible": ok, "rejection_reasons": tuple(rejections)}
+        if not self.candidate_models:
+            if not default_model: return out(source="unconstrained", ok=True)
+            denied, reason = self.is_model_disallowed(default_model, author_models=author_models, author_families=author_families, excluded_models=excluded_models)
+            if denied: rejections.append(reason); return out()
+            return out(default_model, self.resolve_dialect_model(default_model, harness_name, harness_family), "harness_default", True)
+        supported = {str(x).lower() for x in supported_models}
+        for cand in self.candidate_models:
+            source = "preferred" if cand in self.preferred_models else "fallback"; dialect = self.resolve_dialect_model(cand, harness_name, harness_family)
+            reason = next((r for bad, r in (self.is_model_disallowed(x, author_models=author_models, author_families=author_families, excluded_models=excluded_models) for x in dict.fromkeys((cand, dialect))) if bad), "")
+            if reason: rejections.append(f"{cand}:{reason}"); continue
+            if supported and "*" not in supported and cand.lower() not in supported and dialect.lower() not in supported: rejections.append(f"{cand}:unsupported_by_harness"); continue
+            return out(cand, dialect, source, True, source == "fallback" or bool(self.preferred_models and cand != self.preferred_models[0]))
+        return out()
+
 
 class SpecialistPlaceholderBackend(SubagentBackend):
     """Logical placeholder backend for a harness-free Specialist (kind='specialist').
@@ -75,6 +140,7 @@ class SpecialistDefinition:
     allowed_tools: tuple[str, ...] = ()
     denied_tools: tuple[str, ...] = ()
     mcp_server_configs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    model_config: SpecialistModelConfig = field(default_factory=SpecialistModelConfig)
 
     @classmethod
     def from_obj(cls, obj: Any) -> "SpecialistDefinition":
@@ -129,13 +195,13 @@ class SpecialistDefinition:
             disabled_mcp_servers=tuple(read("disabled_mcp_servers", ()) or ()),
             strict_mcp_scope=bool(read("strict_mcp_scope", False)), plugins=tuple(read("plugins", ()) or ()),
             disabled_plugins=tuple(read("disabled_plugins", ()) or ()), allowed_tools=tuple(read("allowed_tools", ()) or ()),
-            denied_tools=tuple(read("denied_tools", ()) or ()), mcp_server_configs=dict(read("mcp_server_configs", {}) or {}),
+            denied_tools=tuple(read("denied_tools", ()) or ()), mcp_server_configs=dict(read("mcp_server_configs", {}) or {}), model_config=SpecialistModelConfig.from_obj(read("model_config", None) or read("modelConfig", None)),
         )
         agents_path = Path(values["agents_md_path"]) if values["agents_md_path"] else None
         if agents_path and agents_path.is_file() and not values["role_prompt"]:
             loaded = cls.from_agents_md(agents_path)
             for key in values:
-                if values[key] in ("", (), {}, False) and getattr(loaded, key) not in ("", (), {}, False):
+                if (key == "model_config" and not values[key].is_configured and loaded.model_config.is_configured) or (key != "model_config" and values[key] in ("", (), {}, False) and getattr(loaded, key) not in ("", (), {}, False)):
                     values[key] = getattr(loaded, key)
         return cls(**values)
 
@@ -145,12 +211,13 @@ class SpecialistDefinition:
 
     @property
     def has_specialist_bundle(self) -> bool:
-        return bool(self.role_prompt.strip() or self.soul_path.strip() or self.skill_packs or self.mcp_servers or self.specialist_dir.strip() or self.agents_md_path.strip() or self.plugins)
+        return bool(self.role_prompt.strip() or self.soul_path.strip() or self.skill_packs or self.mcp_servers or self.specialist_dir.strip() or self.agents_md_path.strip() or self.plugins or self.model_config.is_configured)
 
     def to_agents_md(self, *, resolved_skills_dir: Path | str | None = None) -> str:
         meta = {k: v for k, v in (("name", self.name), ("slug", self.resolved_slug), ("required_capabilities", list(self.required_capabilities)), ("skill_packs", list(self.skill_packs)), ("disabled_skills", list(self.disabled_skills)), ("mcp_servers", list(self.mcp_servers)), ("disabled_mcp_servers", list(self.disabled_mcp_servers)), ("strict_mcp_scope", bool(self.strict_mcp_scope)), ("plugins", list(self.plugins)), ("disabled_plugins", list(self.disabled_plugins)), ("allowed_tools", list(self.allowed_tools)), ("denied_tools", list(self.denied_tools)))}
         meta["startup_skills"] = list(self.startup_skills)
         meta["startup_mcp_servers"] = list(self.startup_mcp_servers)
+        meta["model_config"] = self.model_config.to_dict()
         try:
             import yaml
             front = yaml.safe_dump(meta, sort_keys=False)
@@ -163,6 +230,7 @@ class SpecialistDefinition:
             body += "\n## Linked Skill Packs\n" + "".join(f"- {p}: {root / p / 'SKILL.md'}\n" for p in self.skill_packs)
         if self.mcp_servers or self.disabled_mcp_servers:
             body += f"\n## MCP Scope\nEnabled: {', '.join(self.mcp_servers)}\nDisabled: {', '.join(self.disabled_mcp_servers)}\nstrict_mcp_scope={self.strict_mcp_scope}\n"
+        if self.model_config.is_configured: body += "\n## Model Config\n" + "\n".join(f"{k}: {json.dumps(v)}" for k, v in self.model_config.to_dict().items() if k != "model_aliases") + "\n"
         return f"---\n{front}---\n{body}"
 
     @classmethod
@@ -181,12 +249,14 @@ class SpecialistDefinition:
                         try: meta[k.strip()] = json.loads(v.strip())
                         except json.JSONDecodeError: meta[k.strip()] = v.strip()
         match = re.search(r"<!-- BEGIN ROLE PROMPT -->\s*(.*?)\s*<!-- END ROLE PROMPT -->", body, re.S)
-        role = match.group(1).strip() if match else re.split(r"\n## (?:Linked Skill Packs|MCP Scope)\n", re.sub(r"^# Specialist:.*\n+", "", body).strip())[0].strip()
+        role = match.group(1).strip() if match else re.split(r"\n## (?:Linked Skill Packs|MCP Scope|Model Config)\n", re.sub(r"^# Specialist:.*\n+", "", body).strip())[0].strip()
         parent = agents.parent.resolve(); skills = parent / "skills"
         meta.update(role_prompt=role, specialist_dir=str(parent), agents_md_path=str(agents.resolve()))
         if skills.is_dir(): meta["skill_dirs"] = tuple(meta.get("skill_dirs", ())) + ((str(skills),) if str(skills) not in meta.get("skill_dirs", ()) else ())
         mcp = parent / "mcp.json"
         if mcp.is_file(): meta["mcp_server_configs"] = json.loads(mcp.read_text(encoding="utf-8")).get("mcpServers", {})
+        model_config = parent / "model_config.json"
+        if model_config.is_file() and "model_config" not in meta: meta["model_config"] = json.loads(model_config.read_text(encoding="utf-8"))
         return cls.from_obj(meta)
 
 
@@ -411,6 +481,7 @@ class SpecialistFolderManager:
             if not any(target.iterdir()): (target / "plugin.json").write_text(json.dumps({"name": plugin, "enabled": True}, indent=2), encoding="utf-8")
         servers = {s: spec.mcp_server_configs.get(s, {"type": "stdio", "command": s, "args": [], "enabled": True}) for s in spec.mcp_servers if s not in spec.disabled_mcp_servers and s not in startup_mcp_set}
         _write_json(spec_dir / "mcp.json", {"_omr_meta": {"enabled": [s for s in spec.mcp_servers if s not in startup_mcp_set], "startup_mcps": sorted(set(spec.startup_mcp_servers) | (set(spec.mcp_servers) & set(BUCKET1_STARTUP_MCPS))), "disabled": list(spec.disabled_mcp_servers), "strict_mcp_scope": bool(spec.strict_mcp_scope)}, "mcpServers": servers})
+        _write_json(spec_dir / "model_config.json", spec.model_config.to_dict())
         agents = spec_dir / "AGENTS.md"; agents.write_text(spec.to_agents_md(resolved_skills_dir=skills_dir), encoding="utf-8")
         return dataclass_replace(spec, slug=spec.resolved_slug, specialist_dir=str(spec_dir), agents_md_path=str(agents), skill_dirs=(str(skills_dir), *spec.skill_dirs))
 
@@ -489,11 +560,18 @@ class SessionHarnessFlagBuilder:
         return next((x for x in ("claude", "codex", "copilot", "hermes") if x in value), "generic")
 
     @classmethod
-    def build_for_candidate(cls, specialist: SpecialistDefinition | Any, harness_name: str, *, backend: Any = None) -> dict[str, Any]:
+    def build_for_candidate(cls, specialist: SpecialistDefinition | Any, harness_name: str, *, backend: Any = None, author_models: Sequence[str] = (), author_families: Sequence[str] = (), supported_models: Sequence[str] = (), excluded_models: Sequence[str] = ()) -> dict[str, Any]:
         s = SpecialistDefinition.from_obj(specialist); d = Path(s.specialist_dir) if s.specialist_dir else None; family = cls.detect_harness_family(harness_name, backend)
+        supported_models = supported_models or getattr(backend, "supported_models", None) or getattr(backend, "available_models", None) or ()
+        author_models = author_models or getattr(backend, "author_models", ()) or (); author_families = author_families or getattr(backend, "author_families", ()) or ()
+        model_res = s.model_config.resolve_for_candidate(harness_name, harness_family=family, supported_models=supported_models, default_model=getattr(backend, "model", "") or "", author_models=author_models, author_families=author_families, excluded_models=excluded_models)
+        if s.model_config.is_configured and not model_res["compatible"]: raise SkillContractViolationError(f"Harness {harness_name!r} cannot satisfy specialist {s.name!r} model_config: {model_res['rejection_reasons']}")
+        dialect_model, effort = model_res["dialect_model"], model_res["reasoning_effort"]; acp_session_params: dict[str, Any] = {}
         agents = str(s.agents_md_path or (d / "AGENTS.md" if d else "")); mcp = str(d / "mcp.json") if d else ""; skills = str(d / "skills") if d else ""
         ask=[x for x in s.skill_packs if x not in s.disabled_skills]; am=[x for x in s.mcp_servers if x not in s.disabled_mcp_servers]; dm=list(s.disabled_mcp_servers); ap=[x for x in s.plugins if x not in s.disabled_plugins]; dp=list(s.disabled_plugins); a=[]
         if family == "claude":
+            if dialect_model: a += ["--model", dialect_model]
+            if effort: a += ["--effort", effort]
             if d: a += ["--add-dir", str(d)]
             if s.strict_mcp_scope: a += ["--strict-mcp-config"]
             if mcp and (am or s.strict_mcp_scope): a += ["--mcp-config", mcp]
@@ -503,6 +581,8 @@ class SessionHarnessFlagBuilder:
             if dis: a += ["--disallowedTools", ",".join(dis)]
             if dp: a += ["--disable-plugin", ",".join(dp)]
         elif family == "codex":
+            if dialect_model: a += ["-m", dialect_model]
+            if effort: a += ["-c", f'model_reasoning_effort="{effort}"']
             if skills: a += ["-c", f'skills.dirs=["{skills.replace(chr(92), "/")}"]']
             if s.strict_mcp_scope: a += ["-c", "mcp_servers._strict_scope=true"]
             for m in am: a += ["-c", f"mcp_servers.{m}.enabled=true"]
@@ -513,6 +593,8 @@ class SessionHarnessFlagBuilder:
             for p in ap: a += ["--enable", p]
             for p in dp: a += ["--disable", p]
         elif family == "copilot":
+            if dialect_model: a += ["--model", dialect_model]
+            if effort: a += ["--reasoning-effort", effort]
             if d: a += ["--add-dir", str(d)]
             if s.strict_mcp_scope: a += ["--disable-builtin-mcps"]
             if mcp and am: a += ["--additional-mcp-config", "@"+mcp]
@@ -523,6 +605,8 @@ class SessionHarnessFlagBuilder:
             excluded=list(s.denied_tools)+[f"mcp__{m}__*" for m in dm]+[f"Skill({sk})" for sk in s.disabled_skills]+[f"Plugin({p})" for p in dp]
             if excluded: a += ["--excluded-tools", ",".join(excluded)]
         elif family == "hermes":
+            if dialect_model: a += ["-m", dialect_model]
+            if effort: a += ["--reasoning-effort", effort]
             if ask: a += ["-s", ",".join(ask)]
             tools=list(s.allowed_tools)+[m if m.startswith("mcp-") else "mcp-"+m for m in am]
             if tools: a += ["-t", ",".join(tools)]
@@ -532,11 +616,14 @@ class SessionHarnessFlagBuilder:
             if s.denied_tools: a += ["--deny-tools", ",".join(s.denied_tools)]
             if s.disabled_skills: a += ["--disable-skills", ",".join(s.disabled_skills)]
         else:
+            if dialect_model or effort:
+                values = {k: v for k, v in (("model", dialect_model), ("reasoning_effort", effort)) if v}; acp_session_params = {"session/new": values, "session/set_model": dict(values)}
+                if dialect_model: a += ["--model", dialect_model]
             if (s.strict_mcp_scope or dm or dp or s.denied_tools or s.disabled_skills) and not getattr(backend, "supports_session_isolation", False):
                 raise SkillContractViolationError(f"Harness {harness_name!r} (generic) cannot enforce requested specialist isolation policy")
             if d: a += ["--add-dir", str(d)]
             if mcp and am: a += ["--mcp-config", mcp]
-        return {"harness_family":family,"specialist_dir":str(d) if d else "","agents_md_path":agents,"session_mcp_config":mcp,"session_cli_args":tuple(a),"mcps_enabled":tuple(am),"mcps_disabled":tuple(dm),"plugins_enabled":tuple(ap),"plugins_disabled":tuple(dp),"skills_enabled":tuple(ask),"skills_disabled":tuple(s.disabled_skills)}
+        return {"harness_family":family,"specialist_dir":str(d) if d else "","agents_md_path":agents,"session_mcp_config":mcp,"session_cli_args":tuple(a),"mcps_enabled":tuple(am),"mcps_disabled":tuple(dm),"plugins_enabled":tuple(ap),"plugins_disabled":tuple(dp),"skills_enabled":tuple(ask),"skills_disabled":tuple(s.disabled_skills), "resolved_model": dialect_model, "canonical_model": model_res["canonical_model"], "resolved_provider": model_res["provider"], "resolved_model_family": model_res["model_family"], "reasoning_effort": effort, "model_resolution_source": model_res["resolution_source"], "model_fallback_used": bool(model_res["fallback_used"]), "acp_session_params": acp_session_params}
 
 
 class DirtyBaselineError(RuntimeError):
@@ -585,8 +672,18 @@ class ExecutionIdentity:
     executable_or_endpoint: str = ""
     profile_or_namespace: str = ""
     model: str = ""
+    provider: str = ""
+    model_family: str = ""
+    reasoning_effort: str = ""
+    require_distinct_model_family_from_author: bool = False
+    disallowed_models: tuple[str, ...] = ()
+
+    def resolved_family(self) -> str: return self.model_family.lower().strip() or infer_model_family(self.model)
 
     def conflicts_with(self, other: "ExecutionIdentity") -> bool:
+        same_model = bool(self.model and other.model and self.model.lower() == other.model.lower())
+        family_conflict = bool((self.require_distinct_model_family_from_author or other.require_distinct_model_family_from_author) and self.resolved_family() and self.resolved_family() == other.resolved_family())
+        disallowed = bool((self.disallowed_models and other.model and any(fnmatch.fnmatchcase(other.model.lower(), p.lower()) for p in self.disallowed_models)) or (other.disallowed_models and self.model and any(fnmatch.fnmatchcase(self.model.lower(), p.lower()) for p in other.disallowed_models)))
         return (
             self.agent_name == other.agent_name
             or (
@@ -602,6 +699,8 @@ class ExecutionIdentity:
                 and self.executable_or_endpoint
                 and self.executable_or_endpoint == other.executable_or_endpoint
             )
+            or (same_model and (self.require_distinct_model_family_from_author or other.require_distinct_model_family_from_author or bool(self.provider and self.provider.lower() == other.provider.lower())))
+            or family_conflict or disallowed
         )
 
 
@@ -3206,6 +3305,8 @@ class OmrDispatcher:
 
 
 __all__ = [
+    "SpecialistModelConfig",
+    "infer_model_family",
     "AcceptanceReceipt",
     "BRAND_NAME",
     "CommandReceipt",
