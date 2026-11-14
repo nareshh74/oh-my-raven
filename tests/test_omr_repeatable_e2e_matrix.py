@@ -42,6 +42,7 @@ from oh_my_raven.oh_my_raven import (
     WorktreeManager,
     build_context_charter,
 )
+from raven.agent.subagent.oh_my_raven import HarnessStartupManager
 from raven.agent.subagent.prompt_errors import DagValidationError
 from raven.agent.subagent.registry import SubagentTable, _narrow_build
 from raven.config.schema import (
@@ -669,7 +670,7 @@ class DeterministicHarnessBackend:
             code = QUOTA_CODE_FLOAT_BUG if self.tunnel_view_float_trap else QUOTA_CODE_DECIMAL
             target.write_text(code, encoding="utf-8")
             _git(ws, "add", "src/quota/rate_limiter.py")
-            _git(ws, "commit", "-m", "feat(quota): implement SlidingWindowLimiter.check_quota")
+            _git(ws, "commit", "--allow-empty", "-m", "feat(quota): implement SlidingWindowLimiter.check_quota")
             return json.dumps({"slice": "slice_quota", "committed": True})
 
         if task_id == "slice_gateway":
@@ -914,6 +915,9 @@ class OmrRepeatableTestRig:
         return table
 
     def _wire_deterministic_harness_targets(self, table: SubagentTable) -> None:
+        HarnessStartupManager.reconcile_harness_pool(
+            self.harness_backends, self.base_dir / "harnesses", auto_install=True
+        )
         for hname, hbackend in self.harness_backends.items():
             if hname in table._backends and not isinstance(table._backends[hname], RoutingBackend):
                 table._backends[hname] = hbackend
