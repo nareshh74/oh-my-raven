@@ -683,3 +683,45 @@ class TestR24ModelConfig:
                 ReviewReceipt(verdict="approved", reviewed_head_sha="abc", findings=[],
                               commands=[CommandReceipt("pytest", 0)], reviewer_identity=same_family),
                 candidate_head_sha="abc", reviewer_backend=same_family, author_backends=[author])
+
+    def test_r24_identity_preserved_nonquota_contract_error_and_reraise(self, tmp_path):
+        from oh_my_raven.oh_my_raven import ExecutionIdentity, SkillContractViolationError
+
+        # (a) pre-configured backend identity preserved + enriched; per-attempt reset
+        class _IdHarness(_ModelHarness):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.execution_identity = ExecutionIdentity(
+                    agent_name="X", harness_kind="cli", executable_or_endpoint="x", model="stale")
+
+        a_dir = tmp_path / "a"
+        a_dir.mkdir()
+        h1, h2 = _IdHarness("Claude-Code", ("claude-sonnet-4-6",)), _ModelHarness("Codex-CLI", ("gpt-5.4",))
+        rb, _ = self._rb(a_dir, h1, h2, self._cfg())
+        asyncio.run(rb.run("t", task_id="1", workspace=Path("."), executor=None))
+        assert rb.execution_identity.agent_name == "X"
+        assert rb.execution_identity.model == "claude-sonnet-4-6"
+        assert rb.last_resolved_model == "claude-sonnet-4-6"
+        h1.supported_models = ("claude-3-haiku",)
+        asyncio.run(rb.run("t", task_id="2", workspace=Path("."), executor=None))
+        assert rb.last_resolved_model == "gpt-5.4"
+        assert getattr(rb, "execution_identity", None) is None or rb.execution_identity.model == "gpt-5.4"
+
+        # (b) non-quota contract error mentioning "model" does not burn preferred model
+        b_dir = tmp_path / "b"
+        b_dir.mkdir()
+        h1 = _ModelHarness("Claude-Code", ("claude-sonnet-4-6", "gpt-5.4"),
+                           SkillContractViolationError("missing skill evidence for model_validator pack"))
+        h2 = _ModelHarness("Codex-CLI", ("claude-sonnet-4-6", "gpt-5.4"))
+        rb, _ = self._rb(b_dir, h1, h2, self._cfg())
+        asyncio.run(rb.run("t", task_id="1", workspace=Path("."), executor=None))
+        assert "claude-sonnet-4-6" in h2.args[0] and "gpt-5.4" not in h2.args[0]
+
+        # (c) all fail -> SkillContractViolationError re-raised
+        c_dir = tmp_path / "c"
+        c_dir.mkdir()
+        e = SkillContractViolationError("missing skill evidence")
+        h1, h2 = _ModelHarness("Claude-Code", ("claude-sonnet-4-6",), e), _ModelHarness("Codex-CLI", ("gpt-5.4",), e)
+        rb, _ = self._rb(c_dir, h1, h2, self._cfg())
+        with pytest.raises(SkillContractViolationError):
+            asyncio.run(rb.run("t", task_id="1", workspace=Path("."), executor=None))

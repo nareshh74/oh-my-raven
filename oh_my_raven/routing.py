@@ -1189,6 +1189,12 @@ class RoutingBackend(SubagentBackend):
                     if session_bundle.get(key): session_kwargs.update(optional_keyword(candidate.backend, key, session_bundle[key]))
                 if session_bundle.get("resolved_model") and "model" not in call_kwargs: session_kwargs.update(optional_keyword(candidate.backend, "model", session_bundle["resolved_model"]))
                 for attr in ("last_skill_evidence", "last_invoked_tools", "last_invoked_mcps", "last_review_receipt", "last_cto_strategic_brief", "last_cto_brief", "last_consequence_matrix", "execution_identity"):
+                    if attr == "execution_identity" and hasattr(self, attr):
+                        try:
+                            delattr(self, attr)
+                        except AttributeError:
+                            pass
+                        continue
                     if hasattr(self, attr):
                         try:
                             delattr(self, attr)
