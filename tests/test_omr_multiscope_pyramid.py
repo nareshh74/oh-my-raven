@@ -355,7 +355,7 @@ class TestOutsideInScope:
                 _git(wt, "commit", "-q", "-m", "verified feature")
                 return json.dumps({
                     "evidence": {"artifact_path": "verified_feature.py"},
-                    "invoked_mcps": ["codebase-memory"], "invoked_tools": ["read_file"],
+                    "invoked_mcps": ["codebase-memory", "custom-audit-mcp"], "invoked_tools": ["read_file"],
                     "skill_evidence": {"superpowers": {"command": "python verify_tdd.py", "exit_code": 0,
                                                        "output_ref": proc.stdout.strip()}},
                 })
@@ -369,7 +369,7 @@ class TestOutsideInScope:
             [RouteTarget("Claude-Code", "primary", flaky), RouteTarget("Copilot-CLI", "fallback", good)],
             specialist_definition={"name": "TDD-Implementer", "role_prompt": "Strict TDD specialist.",
                                    "skill_packs": ["superpowers"], "skill_dirs": [str(pack.parent)],
-                                   "mcp_servers": ["codebase-memory"], "disabled_mcp_servers": ["github"],
+                                   "mcp_servers": ["codebase-memory", "custom-audit-mcp"], "disabled_mcp_servers": ["github"],
                                    "strict_mcp_scope": True,
                                    "startup_skills": ["andrej-karpathy-skill", "autonomous-delivery"],
                                    "startup_mcp_servers": ["everos"]},

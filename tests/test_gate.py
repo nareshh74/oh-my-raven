@@ -5,10 +5,13 @@ import pytest
 
 from oh_my_raven.gate import CouncilVote, LessonsStore, GatePolicy, classify_triage_tier, escalate_triage_tier, evaluate_council_consensus
 from pathlib import Path
+from types import SimpleNamespace
 
 from oh_my_raven.oh_my_raven import (
     BUCKET1_STARTUP_MCPS,
+    BUCKET1_STARTUP_PLUGINS,
     BUCKET1_STARTUP_SKILLS,
+    SkillAndToolReceiptGate,
     BUCKET2_SPECIALIST_FAMILIES,
     HarnessStartupContractViolationError,
     HarnessStartupManager,
@@ -354,7 +357,48 @@ def test_bucket1_harness_onboarding_probe_and_bucket2_gstack_separation(tmp_path
     assert set(BUCKET1_STARTUP_MCPS) <= set(receipt.installed_mcps)
     assert (home / "startup_manifest.json").is_file()
 
+    # Finding #4: plugin payloads
+    assert set(BUCKET1_STARTUP_PLUGINS) <= set(receipt.installed_plugins)
+    assert receipt.missing_plugins == ()
+    for p in BUCKET1_STARTUP_PLUGINS:
+        assert (home / "plugins" / p / "plugin.json").is_file(), p
+
+    # Finding #1: existing mcp.json entries preserved
+    cfg = json.loads((home / "mcp.json").read_text())
+    cfg["mcpServers"]["custom-corp-mcp"] = {"type": "stdio", "command": "corp-mcp",
+                                            "args": ["--prod"], "enabled": True}
+    cfg["mcpServers"]["trail"]["args"] = ["--custom-flag"]
+    (home / "mcp.json").write_text(json.dumps(cfg))
+    HarnessStartupManager.ensure_and_verify_harness("Claude-Code", root, auto_install=True)
+    cfg2 = json.loads((home / "mcp.json").read_text())["mcpServers"]
+    assert "custom-corp-mcp" in cfg2 and "--custom-flag" in cfg2["trail"]["args"]
+    assert set(BUCKET1_STARTUP_MCPS) <= set(cfg2)
+
+    # Finding #3: unsafe names rejected
+    with pytest.raises(ValueError):
+        HarnessStartupManager.ensure_and_verify_harness("Claude-Code", root, required_startup_skills=("../escape",))
+    with pytest.raises(ValueError):
+        HarnessStartupManager.ensure_and_verify_harness("Claude-Code", root, required_startup_mcps=("a/b",))
+    with pytest.raises(ValueError):
+        HarnessStartupManager.ensure_and_verify_harness("../bad", root)
+
+    # Finding #3: disabled MCP rejected
+    dh = tmp_path / "disabled_h"
+    drec = HarnessStartupManager.ensure_and_verify_harness("Claude-Code", dh, auto_install=True)
+    dmcp = Path(drec.harness_home) / "mcp.json"
+    dcfg = json.loads(dmcp.read_text())
+    dcfg["mcpServers"]["everos"] = {"type": "stdio", "command": "everos", "args": [], "enabled": False}
+    dmcp.write_text(json.dumps(dcfg))
+    with pytest.raises(HarnessStartupContractViolationError):
+        HarnessStartupManager.ensure_and_verify_harness("Claude-Code", dh, auto_install=False)
+
+    # Finding #4: empty plugin dir is not installed
+    (home / "plugins" / "everos" / "plugin.json").unlink()
+    with pytest.raises(HarnessStartupContractViolationError):
+        HarnessStartupManager.ensure_and_verify_harness("Claude-Code", root, auto_install=False)
+
     spec = SpecialistDefinition(name="CTO", skill_packs=("gstack", "andrej-karpathy-skill"),
+                                mcp_servers=("trail", "custom-specialist-mcp"),
                                 startup_skills=("andrej-karpathy-skill", "autonomous-delivery"),
                                 startup_mcp_servers=("everos", "trail"))
     mat = SpecialistFolderManager.ensure_specialist_dir(spec, tmp_path / "specialists",
@@ -365,6 +409,20 @@ def test_bucket1_harness_onboarding_probe_and_bucket2_gstack_separation(tmp_path
     loaded = SpecialistDefinition.from_agents_md(sdir)
     assert loaded.startup_skills == spec.startup_skills
     assert loaded.startup_mcp_servers == spec.startup_mcp_servers
+
+    # Finding #5: Bucket-1 MCP not duplicated; Bucket-2 kept
+    spec_mcp = json.loads((sdir / "mcp.json").read_text())
+    assert "trail" not in spec_mcp["mcpServers"]
+    assert "trail" in spec_mcp["_omr_meta"]["startup_mcps"]
+    assert "custom-specialist-mcp" in spec_mcp["mcpServers"]
+
+    # Finding #2: fail closed without startup_receipt
+    with pytest.raises(SkillContractViolationError):
+        SkillAndToolReceiptGate.verify_specialist_execution(
+            SimpleNamespace(id="n1", specialist_definition=spec), SimpleNamespace(),
+            json.dumps({"skill_evidence": {"gstack": {"command": "gstack", "exit_code": 0}},
+                        "invoked_mcps": ["custom-specialist-mcp"]}),
+            require_skill_evidence=True)
 
 
 def test_reconcile_harness_pool_eliminates_bucket1_drift(tmp_path):
