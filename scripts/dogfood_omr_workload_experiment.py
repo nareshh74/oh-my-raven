@@ -312,7 +312,9 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
             git(wt, "commit", "-q", "-m", "arch verified")
             return json.dumps({"evidence": {"artifact_path": "arch_ok.txt"}, "invoked_mcps": ["codebase-memory"],
                                "skill_evidence": {"superpowers": {"command": "python check_arch.py", "exit_code": 0,
-                                                                  "output_ref": r.stdout.strip()}}})
+                                                                  "output_ref": r.stdout.strip()},
+                                                 "gstack": {"command": "gstack --skill plan-eng-review", "exit_code": 0,
+                                                            "output_ref": "GSTACK_OK"}}})
         spec = SpecialistDefinition(name="Arch-Verifier", role_prompt="Verify architecture and boundaries.",
                                     skill_packs=("superpowers", "gstack"), disabled_skills=("legacy-skill",),
                                     startup_skills=("andrej-karpathy-skill", "autonomous-delivery"),
