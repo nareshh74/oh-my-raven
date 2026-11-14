@@ -12,13 +12,16 @@ from typing import Any
 
 import pytest
 
-from raven.agent.subagent.backends.routing import (
+import inspect
+
+from oh_my_raven.routing import (
     RouteTarget,
     RoutingBackend,
     SubagentFailoverBlockedError,
+    SubagentFailoverExhaustedError,
 )
 from raven.agent.subagent.dag_graph import DagNodeSpec, SubAgentDagSpec
-from raven.agent.subagent.oh_my_raven import (
+from oh_my_raven.oh_my_raven import (
     AcceptanceReceipt,
     BRAND_NAME,
     CommandReceipt,
@@ -581,7 +584,21 @@ class DeterministicHarnessBackend:
         self.last_invoked_tools = ("read_file", "write_file", "exec")
         self.last_invoked_mcps = tuple(mcps)
 
-    async def run(
+    async def run(self, task: str, *, task_id: str, **kwargs: Any) -> str:
+        out = await self._run_impl(task, task_id=task_id, **kwargs)
+        if task_id.endswith(("::cto_intake", "::decompose")):
+            return out
+        try:
+            data = json.loads(out)
+        except ValueError:
+            return out
+        if isinstance(data, dict) and "artifact_path" not in data:
+            # Verifiable done-gate evidence: an existing non-empty artifact in the repo.
+            data["artifact_path"] = "src/api/gateway.py"
+            return json.dumps(data)
+        return out
+
+    async def _run_impl(
         self,
         task: str,
         *,
@@ -1737,3 +1754,11 @@ def test_11_seven_by_five_specialist_harness_matrix_hot_onboarding_and_crash_fai
 
     # Cleanup dirty_wt
     _git(rig.repo, "worktree", "remove", "--force", str(dirty_wt), check=False)
+
+
+def test_candidate_module_source_of_truth_is_local_repo() -> None:
+    pkg = (Path(__file__).resolve().parent.parent / "oh_my_raven").resolve()
+    for obj in (OmrDispatcher, RoutingBackend):
+        assert obj.__module__.startswith("oh_my_raven")
+        src = Path(inspect.getsourcefile(obj)).resolve()
+        assert src.is_relative_to(pkg), src

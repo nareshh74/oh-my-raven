@@ -18,6 +18,25 @@ for _cand in reversed(_CANDIDATES):
             sys.path.remove(str(_cand))
         sys.path.insert(0, str(_cand))
 
+# Single source of truth: any raven.agent.subagent.* import resolves to this repo's oh_my_raven.
+import oh_my_raven.routing as _omr_routing_mod  # noqa: E402
+
+# Routing must be aliased BEFORE raven.agent.subagent (registry) is first imported.
+sys.modules["raven.agent.subagent.backends.routing"] = _omr_routing_mod
+import oh_my_raven.oh_my_raven as _omr_mod  # noqa: E402
+
+sys.modules["raven.agent.subagent.oh_my_raven"] = _omr_mod
+
+# sys.modules alone is not enough: parents/registry may already hold the old objects.
+import raven.agent.subagent as _pkg  # noqa: E402
+import raven.agent.subagent.backends as _backends_pkg  # noqa: E402
+import raven.agent.subagent.registry as _registry  # noqa: E402
+
+_pkg.oh_my_raven = _omr_mod
+_backends_pkg.routing = _omr_routing_mod
+_registry.RoutingBackend = _omr_routing_mod.RoutingBackend
+_registry.RouteTarget = _omr_routing_mod.RouteTarget
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     group = parser.getgroup("oh-my-raven")

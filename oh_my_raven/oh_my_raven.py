@@ -12,17 +12,23 @@ import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 from pathlib import Path
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from loguru import logger
 
 from raven.agent.subagent.dag_graph import DagNodeSpec
 from raven.agent.subagent.prompt_errors import DagValidationError
 from raven.contracts.subagent_backend import SubagentBackend, SubagentNoAnswerError
+from .gate import LessonsStore, TriageDecision, classify_triage_tier, escalate_triage_tier, evaluate_council_consensus, GatePolicy, has_verifiable_evidence
+from .routing import RouteTarget, RoutingBackend, SubagentRetryableError
 
 BRAND_NAME = "oh-my-raven"
+BUCKET1_STARTUP_SKILLS: tuple[str, ...] = ("i-have-adhd", "humanizer", "caveman", "andrej-karpathy-skill", "autonomous-delivery", "codeburn", "repo-context", "leanrea", "ship", "trail", "archify", "floorplan")
+BUCKET1_STARTUP_MCPS: tuple[str, ...] = ("everos", "trail", "codebase-memory", "playwright")
+BUCKET1_STARTUP_PLUGINS: tuple[str, ...] = ("context-mode", "token-optimizer", "codeburn-startup", "repo-context-hook", "everos")
+BUCKET2_SPECIALIST_FAMILIES: tuple[str, ...] = ("gstack", "superpowers", "ecc", "mattpocock", "agent-skills", "pstack", "open-code-review")
 
 
 class SpecialistPlaceholderBackend(SubagentBackend):
@@ -54,13 +60,30 @@ class SpecialistDefinition:
     skill_packs: tuple[str, ...] = ()
     skill_dirs: tuple[str, ...] = ()
     mcp_servers: tuple[str, ...] = ()
+    startup_skills: tuple[str, ...] = ()
+    startup_mcp_servers: tuple[str, ...] = ()
     required_capabilities: tuple[str, ...] = ()
     is_harness: bool = False
+    slug: str = ""
+    specialist_dir: str = ""
+    agents_md_path: str = ""
+    disabled_skills: tuple[str, ...] = ()
+    disabled_mcp_servers: tuple[str, ...] = ()
+    strict_mcp_scope: bool = False
+    plugins: tuple[str, ...] = ()
+    disabled_plugins: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] = ()
+    denied_tools: tuple[str, ...] = ()
+    mcp_server_configs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def from_obj(cls, obj: Any) -> "SpecialistDefinition":
         if isinstance(obj, SpecialistDefinition):
             return obj
+        if isinstance(obj, (str, Path)):
+            path = Path(obj)
+            if path.name.upper() == "AGENTS.MD" or (path.is_dir() and (path / "AGENTS.md").is_file()):
+                return cls.from_agents_md(path)
         read = obj.get if isinstance(obj, dict) else lambda k, d=None: getattr(obj, k, d)
         name = str(read("name", "") or "")
         kind = str(read("kind", "") or "")
@@ -78,6 +101,8 @@ class SpecialistDefinition:
             )
             if str(m)
         )
+        startup_skills = tuple(str(s) for s in (read("startup_skills", None) or read("startupSkills", None) or ()) if str(s))
+        startup_mcp_servers = tuple(str(s) for s in (read("startup_mcp_servers", None) or read("startupMcpServers", None) or ()) if str(s))
         req_caps = tuple(
             str(c)
             for c in (read("required_capabilities", None) or read("requiredCapabilities", None) or ())
@@ -87,20 +112,86 @@ class SpecialistDefinition:
         if is_harness_raw is None:
             is_harness_raw = read("isHarness", None)
         is_harness = False if kind == "specialist" else (True if is_harness_raw is None else bool(is_harness_raw))
-        return cls(
+        values = dict(
             name=name,
             role_prompt=role_prompt,
             soul_path=soul_path,
             skill_packs=skill_packs,
             skill_dirs=skill_dirs,
             mcp_servers=mcp_servers,
+            startup_skills=startup_skills,
+            startup_mcp_servers=startup_mcp_servers,
             required_capabilities=req_caps,
             is_harness=is_harness,
+            slug=str(read("slug", "") or ""), specialist_dir=str(read("specialist_dir", "") or ""),
+            agents_md_path=str(read("agents_md_path", "") or ""),
+            disabled_skills=tuple(read("disabled_skills", ()) or ()),
+            disabled_mcp_servers=tuple(read("disabled_mcp_servers", ()) or ()),
+            strict_mcp_scope=bool(read("strict_mcp_scope", False)), plugins=tuple(read("plugins", ()) or ()),
+            disabled_plugins=tuple(read("disabled_plugins", ()) or ()), allowed_tools=tuple(read("allowed_tools", ()) or ()),
+            denied_tools=tuple(read("denied_tools", ()) or ()), mcp_server_configs=dict(read("mcp_server_configs", {}) or {}),
         )
+        agents_path = Path(values["agents_md_path"]) if values["agents_md_path"] else None
+        if agents_path and agents_path.is_file() and not values["role_prompt"]:
+            loaded = cls.from_agents_md(agents_path)
+            for key in values:
+                if values[key] in ("", (), {}, False) and getattr(loaded, key) not in ("", (), {}, False):
+                    values[key] = getattr(loaded, key)
+        return cls(**values)
+
+    @property
+    def resolved_slug(self) -> str:
+        return self.slug.strip() or _slugify_specialist(self.name)
 
     @property
     def has_specialist_bundle(self) -> bool:
-        return bool(self.role_prompt.strip() or self.soul_path.strip() or self.skill_packs or self.mcp_servers)
+        return bool(self.role_prompt.strip() or self.soul_path.strip() or self.skill_packs or self.mcp_servers or self.specialist_dir.strip() or self.agents_md_path.strip() or self.plugins)
+
+    def to_agents_md(self, *, resolved_skills_dir: Path | str | None = None) -> str:
+        meta = {k: v for k, v in (("name", self.name), ("slug", self.resolved_slug), ("required_capabilities", list(self.required_capabilities)), ("skill_packs", list(self.skill_packs)), ("disabled_skills", list(self.disabled_skills)), ("mcp_servers", list(self.mcp_servers)), ("disabled_mcp_servers", list(self.disabled_mcp_servers)), ("strict_mcp_scope", bool(self.strict_mcp_scope)), ("plugins", list(self.plugins)), ("disabled_plugins", list(self.disabled_plugins)), ("allowed_tools", list(self.allowed_tools)), ("denied_tools", list(self.denied_tools)))}
+        meta["startup_skills"] = list(self.startup_skills)
+        meta["startup_mcp_servers"] = list(self.startup_mcp_servers)
+        try:
+            import yaml
+            front = yaml.safe_dump(meta, sort_keys=False)
+        except ImportError:
+            front = "\n".join(f"{k}: {json.dumps(v)}" for k, v in meta.items()) + "\n"
+        soul = SkillPackResolver.resolve_soul_text(self) or f"You are {self.name}, a specialized oh-my-raven agent."
+        body = f"# Specialist: {self.name}\n\n<!-- BEGIN ROLE PROMPT -->\n{soul}\n<!-- END ROLE PROMPT -->\n"
+        if self.skill_packs:
+            root = Path(resolved_skills_dir) if resolved_skills_dir else Path("skills")
+            body += "\n## Linked Skill Packs\n" + "".join(f"- {p}: {root / p / 'SKILL.md'}\n" for p in self.skill_packs)
+        if self.mcp_servers or self.disabled_mcp_servers:
+            body += f"\n## MCP Scope\nEnabled: {', '.join(self.mcp_servers)}\nDisabled: {', '.join(self.disabled_mcp_servers)}\nstrict_mcp_scope={self.strict_mcp_scope}\n"
+        return f"---\n{front}---\n{body}"
+
+    @classmethod
+    def from_agents_md(cls, path: Path | str) -> "SpecialistDefinition":
+        agents = Path(path).expanduser(); agents = agents / "AGENTS.md" if agents.is_dir() else agents
+        raw = agents.read_text(encoding="utf-8"); meta: dict[str, Any] = {}; body = raw
+        if raw.startswith("---\n") and "\n---\n" in raw[4:]:
+            front, body = raw[4:].split("\n---\n", 1)
+            try:
+                import yaml
+                meta = yaml.safe_load(front) or {}
+            except ImportError:
+                for line in front.splitlines():
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        try: meta[k.strip()] = json.loads(v.strip())
+                        except json.JSONDecodeError: meta[k.strip()] = v.strip()
+        match = re.search(r"<!-- BEGIN ROLE PROMPT -->\s*(.*?)\s*<!-- END ROLE PROMPT -->", body, re.S)
+        role = match.group(1).strip() if match else re.split(r"\n## (?:Linked Skill Packs|MCP Scope)\n", re.sub(r"^# Specialist:.*\n+", "", body).strip())[0].strip()
+        parent = agents.parent.resolve(); skills = parent / "skills"
+        meta.update(role_prompt=role, specialist_dir=str(parent), agents_md_path=str(agents.resolve()))
+        if skills.is_dir(): meta["skill_dirs"] = tuple(meta.get("skill_dirs", ())) + ((str(skills),) if str(skills) not in meta.get("skill_dirs", ()) else ())
+        mcp = parent / "mcp.json"
+        if mcp.is_file(): meta["mcp_server_configs"] = json.loads(mcp.read_text(encoding="utf-8")).get("mcpServers", {})
+        return cls.from_obj(meta)
+
+
+def _slugify_specialist(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-") or "specialist"
 
 
 _PORTABLE_SKILL_PACK_LIBRARY: dict[str, str] = {
@@ -137,6 +228,9 @@ class SkillPackResolver:
 
     DEFAULT_SKILL_SEARCH_ROOTS: tuple[Path, ...] = (
         Path.home() / ".raven" / "workspace" / "skills",
+        Path.home() / ".claude" / "skills",
+        Path.home() / ".codex" / "skills",
+        Path.home() / ".copilot" / "skills",
         Path.home() / "AppData" / "Local" / "hermes" / "profiles",
     )
 
@@ -207,6 +301,12 @@ class SkillPackResolver:
         if "[BEGIN SPECIALIST BUNDLE:" in task_prompt:
             return task_prompt
         sections: list[str] = [f"[BEGIN SPECIALIST BUNDLE: {spec.name or 'Specialist'}]"]
+        if spec.specialist_dir or spec.agents_md_path:
+            sections.append(
+                "## Specialist Folder & AGENTS.md\n"
+                f"Specialist Directory: {spec.specialist_dir}\nAGENTS.md Path: {spec.agents_md_path}\n"
+                f"Skills Directory: {Path(spec.specialist_dir) / 'skills'}\nMCP Config Path: {Path(spec.specialist_dir) / 'mcp.json'}"
+            )
         soul = cls.resolve_soul_text(spec)
         if soul:
             sections.append(f"## Specialist Role & Charter\n{_SECRET.sub('[REDACTED]', soul)}")
@@ -229,6 +329,214 @@ class SkillPackResolver:
 
 
 SkillPackInjector = SkillPackResolver
+
+
+class SpecialistFolderManager:
+    @staticmethod
+    def _validate_safe_component(value: str, label: str) -> str:
+        cleaned = value.strip()
+        if (
+            not cleaned
+            or cleaned in (".", "..")
+            or "/" in cleaned
+            or "\\" in cleaned
+            or ":" in cleaned
+            or Path(cleaned).is_absolute()
+            or any(part in ("", ".", "..") for part in Path(cleaned).parts)
+        ):
+            raise ValueError(f"Unsafe specialist {label} path component: {value!r}")
+        return cleaned
+
+    @staticmethod
+    def _ensure_within(root: Path, target: Path, label: str) -> Path:
+        try:
+            target.parent.resolve().relative_to(root.resolve())
+        except ValueError as exc:
+            raise ValueError(f"{label} escapes root {root}: {target}") from exc
+        return target
+
+    @staticmethod
+    def _find(root: Path, name: str) -> Path | None:
+        for candidate in (root / name, root / name.lower()):
+            if candidate.is_dir() and ((candidate / "SKILL.md").is_file() or any(candidate.iterdir())):
+                return candidate.resolve()
+        if root.name == "profiles" and root.is_dir():
+            return next((p.parent for p in root.glob(f"*/skills/{name}/SKILL.md")), None)
+        return None
+
+    @classmethod
+    def ensure_specialist_dir(cls, specialist: SpecialistDefinition | Any, specialists_root: Path | str, *, extra_skill_roots: Sequence[str | Path] = (), extra_plugin_roots: Sequence[str | Path] = (), force_specialist_skills: Sequence[str] = ()) -> SpecialistDefinition:
+        spec = SpecialistDefinition.from_obj(specialist)
+        if spec.slug.strip(): cls._validate_safe_component(spec.slug, "slug")
+        slug = cls._validate_safe_component(spec.resolved_slug, "slug")
+        skill_packs = tuple(cls._validate_safe_component(p, "skill_pack") for p in spec.skill_packs)
+        disabled_skills = tuple(cls._validate_safe_component(p, "skill_pack") for p in spec.disabled_skills)
+        plugins = tuple(cls._validate_safe_component(p, "plugin") for p in spec.plugins)
+        disabled_plugins = tuple(cls._validate_safe_component(p, "plugin") for p in spec.disabled_plugins)
+        root_resolved = Path(specialists_root).expanduser().resolve()
+        spec_dir = cls._ensure_within(root_resolved, root_resolved / slug, "specialist_dir")
+        skills_dir, plugins_dir = spec_dir / "skills", spec_dir / "plugins"
+        skills_dir.mkdir(parents=True, exist_ok=True); plugins_dir.mkdir(parents=True, exist_ok=True)
+        def remove_entry(entry: Path) -> None:
+            if entry.is_symlink(): entry.unlink()
+            elif os.name == "nt" and entry.is_dir() and entry.stat().st_file_attributes & 0x400: os.rmdir(entry)
+            elif entry.is_dir(): shutil.rmtree(entry)
+            else: entry.unlink()
+        startup_skill_set = set(spec.startup_skills) | set(BUCKET1_STARTUP_SKILLS)
+        startup_mcp_set = set(spec.startup_mcp_servers) | set(BUCKET1_STARTUP_MCPS)
+        active_skills = {p for p in skill_packs if p not in disabled_skills and (p not in startup_skill_set or p in force_specialist_skills)}
+        active_plugins = {p for p in plugins if p not in disabled_plugins}
+        for entry in skills_dir.iterdir():
+            if entry.name not in active_skills: remove_entry(entry)
+        for entry in plugins_dir.iterdir():
+            if entry.name not in active_plugins: remove_entry(entry)
+        def materialize(src: Path | None, dst: Path) -> None:
+            if dst.exists() or dst.is_symlink(): return
+            if src and src.resolve() != dst.resolve():
+                try: os.symlink(src, dst, target_is_directory=True); return
+                except OSError:
+                    if os.name == "nt" and subprocess.run(["cmd", "/c", "mklink", "/J", str(dst), str(src)], capture_output=True).returncode == 0: return
+                    shutil.copytree(src, dst, dirs_exist_ok=True); return
+            dst.mkdir(parents=True, exist_ok=True)
+        roots = tuple(Path(p).expanduser() for p in (*spec.skill_dirs, *extra_skill_roots)) + SkillPackResolver.DEFAULT_SKILL_SEARCH_ROOTS
+        for pack in skill_packs:
+            if pack in disabled_skills or (pack in startup_skill_set and pack not in force_specialist_skills): continue
+            src = next((found for root in roots if (found := cls._find(root, pack))), None); target = skills_dir / pack
+            materialize(src, target)
+            if not (target / "SKILL.md").is_file(): (target / "SKILL.md").write_text(SkillPackResolver.resolve_skill_pack_text(pack, extra_dirs=spec.skill_dirs), encoding="utf-8")
+        for plugin in plugins:
+            if plugin in disabled_plugins: continue
+            src = next((p / plugin for p in map(Path, extra_plugin_roots) if (p / plugin).is_dir()), None); target = plugins_dir / plugin
+            materialize(src, target)
+            if not any(target.iterdir()): (target / "plugin.json").write_text(json.dumps({"name": plugin, "enabled": True}, indent=2), encoding="utf-8")
+        servers = {s: spec.mcp_server_configs.get(s, {"type": "stdio", "command": s, "args": [], "enabled": True}) for s in spec.mcp_servers if s not in spec.disabled_mcp_servers and s not in startup_mcp_set}
+        _write_json(spec_dir / "mcp.json", {"_omr_meta": {"enabled": [s for s in spec.mcp_servers if s not in startup_mcp_set], "startup_mcps": sorted(set(spec.startup_mcp_servers) | (set(spec.mcp_servers) & set(BUCKET1_STARTUP_MCPS))), "disabled": list(spec.disabled_mcp_servers), "strict_mcp_scope": bool(spec.strict_mcp_scope)}, "mcpServers": servers})
+        agents = spec_dir / "AGENTS.md"; agents.write_text(spec.to_agents_md(resolved_skills_dir=skills_dir), encoding="utf-8")
+        return dataclass_replace(spec, slug=spec.resolved_slug, specialist_dir=str(spec_dir), agents_md_path=str(agents), skill_dirs=(str(skills_dir), *spec.skill_dirs))
+
+
+class HarnessStartupContractViolationError(RuntimeError): pass
+
+@dataclass(frozen=True)
+class HarnessStartupReceipt:
+    harness_name: str; harness_family: str; harness_home: str
+    installed_skills: tuple[str, ...] = (); installed_mcps: tuple[str, ...] = (); installed_plugins: tuple[str, ...] = ()
+    missing_skills: tuple[str, ...] = (); missing_mcps: tuple[str, ...] = (); missing_plugins: tuple[str, ...] = (); manifest_path: str = ""; ready: bool = True
+
+class HarnessStartupManager:
+    @classmethod
+    def ensure_and_verify_harness(cls, harness_name: str, harness_root: Path | str, *, backend: Any = None, required_startup_skills: Sequence[str] = BUCKET1_STARTUP_SKILLS, required_startup_mcps: Sequence[str] = BUCKET1_STARTUP_MCPS, required_startup_plugins: Sequence[str] = BUCKET1_STARTUP_PLUGINS, extra_skill_roots: Sequence[str | Path] = (), auto_install: bool = True) -> HarnessStartupReceipt:
+        if not str(harness_name).strip() or "/" in str(harness_name) or "\\" in str(harness_name) or ".." in str(harness_name) or ":" in str(harness_name): raise ValueError(f"Unsafe harness name: {harness_name!r}")
+        for s in required_startup_skills: SpecialistFolderManager._validate_safe_component(s, "startup_skill")
+        for m in required_startup_mcps: SpecialistFolderManager._validate_safe_component(m, "startup_mcp")
+        for p in required_startup_plugins: SpecialistFolderManager._validate_safe_component(p, "startup_plugin")
+        root = Path(harness_root).expanduser().resolve(); h_dir = SpecialistFolderManager._ensure_within(root, root / _slugify_specialist(harness_name), "harness_home")
+        skills, plugins, hooks = h_dir / "skills", h_dir / "plugins", h_dir / "hooks"
+        for d in (skills, plugins, hooks): d.mkdir(parents=True, exist_ok=True)
+        if auto_install:
+            roots = tuple(Path(p).expanduser() for p in extra_skill_roots) + SkillPackResolver.DEFAULT_SKILL_SEARCH_ROOTS
+            for name in required_startup_skills:
+                dst = skills / name; src = next((x for r in roots if (x := SpecialistFolderManager._find(r, name))), None)
+                if not dst.exists():
+                    if src:
+                        try: os.symlink(src, dst, target_is_directory=True)
+                        except OSError: shutil.copytree(src, dst, dirs_exist_ok=True)
+                    else: dst.mkdir(parents=True)
+                if not (dst / "SKILL.md").is_file(): (dst / "SKILL.md").write_text(SkillPackResolver.resolve_skill_pack_text(name, extra_dirs=extra_skill_roots), encoding="utf-8")
+            try: existing_doc = json.loads((h_dir / "mcp.json").read_text(encoding="utf-8")) if (h_dir / "mcp.json").is_file() else {}
+            except (OSError, ValueError): existing_doc = {}
+            servers = dict(existing_doc.get("mcpServers") or {})
+            for m in required_startup_mcps:
+                if m not in servers or not isinstance(servers[m], dict): servers[m] = {"type": "stdio", "command": m, "args": [], "enabled": True}
+                else: servers[m].setdefault("type", "stdio"); servers[m].setdefault("command", m); servers[m]["enabled"] = True
+            _write_json(h_dir / "mcp.json", {"_omr_meta": {"bucket": 1, "required_mcps": list(required_startup_mcps)}, **existing_doc, "mcpServers": servers})
+            _write_json(hooks / "startup_hooks.json", {"hooks": ["everos", "wiki_session_route", "token-optimizer", "codeburn-startup", "repo-context-hook"]})
+            for p in required_startup_plugins:
+                pdir = plugins / p; pdir.mkdir(exist_ok=True)
+                if not ((pdir / "plugin.json").is_file() or (pdir / "__init__.py").is_file()): (pdir / "plugin.json").write_text(json.dumps({"name": p, "bucket": 1, "enabled": True}, indent=2), encoding="utf-8")
+        installed_skills = tuple(s for s in required_startup_skills if (skills / s / "SKILL.md").is_file()); missing_skills = tuple(s for s in required_startup_skills if s not in installed_skills)
+        try: servers = json.loads((h_dir / "mcp.json").read_text(encoding="utf-8")).get("mcpServers", {})
+        except (OSError, ValueError): servers = {}
+        installed_mcps = tuple(m for m in required_startup_mcps if m in servers and isinstance(servers[m], dict) and servers[m].get("enabled", True) is not False and bool(str(servers[m].get("command", "") or servers[m].get("url", "")).strip())); missing_mcps = tuple(m for m in required_startup_mcps if m not in installed_mcps)
+        def plugin_installed(p: str) -> bool:
+            pdir = plugins / p
+            try: enabled_manifest = (pdir / "plugin.json").is_file() and json.loads((pdir / "plugin.json").read_text(encoding="utf-8")).get("enabled", True) is not False
+            except (OSError, ValueError): enabled_manifest = False
+            return pdir.is_dir() and (enabled_manifest or (pdir / "__init__.py").is_file())
+        installed_plugins = tuple(p for p in required_startup_plugins if plugin_installed(p)); missing_plugins = tuple(p for p in required_startup_plugins if p not in installed_plugins); manifest = h_dir / "startup_manifest.json"
+        data = dict(harness_name=harness_name, harness_family=SessionHarnessFlagBuilder.detect_harness_family(harness_name, backend), harness_home=str(h_dir), installed_skills=installed_skills, installed_mcps=installed_mcps, installed_plugins=installed_plugins, missing_skills=missing_skills, missing_mcps=missing_mcps, missing_plugins=missing_plugins, ready=not (missing_skills or missing_mcps or missing_plugins)); _write_json(manifest, data)
+        receipt = HarnessStartupReceipt(**data, manifest_path=str(manifest))
+        if missing_skills or missing_mcps or missing_plugins: raise HarnessStartupContractViolationError(f"Harness {harness_name!r} failed startup onboarding probe: missing_skills={missing_skills}, missing_mcps={missing_mcps}, missing_plugins={missing_plugins}")
+        for attr, value in (("startup_receipt", receipt), ("harness_home", str(h_dir))):
+            try: setattr(backend, attr, value)
+            except (AttributeError, TypeError): pass
+        return receipt
+
+    @classmethod
+    def reconcile_harness_pool(cls, harnesses: Mapping[str, Any] | Sequence[tuple[str, Any]], harness_root: Path | str, **kwargs: Any) -> dict[str, Any]:
+        raw_items = harnesses.items() if isinstance(harnesses, Mapping) else harnesses
+        items = [(x, None) if isinstance(x, str) else tuple(x) for x in raw_items]
+        receipts = {n: cls.ensure_and_verify_harness(n, harness_root, backend=b, **kwargs) for n, b in items}
+        skill_sets = [set(r.installed_skills) for r in receipts.values()]; mcp_sets = [set(r.installed_mcps) for r in receipts.values()]; plugin_sets = [set(r.installed_plugins) for r in receipts.values()]
+        su = set().union(*skill_sets) if skill_sets else set(); mu = set().union(*mcp_sets) if mcp_sets else set(); plugin_union = set().union(*plugin_sets) if plugin_sets else set()
+        drift = {n: {"missing_skills": sorted(su - set(r.installed_skills)), "missing_mcps": sorted(mu - set(r.installed_mcps)), "missing_plugins": sorted(plugin_union - set(r.installed_plugins))} for n, r in receipts.items()}
+        return {"receipts": receipts, "skills_intersection": tuple(sorted(set.intersection(*skill_sets))) if skill_sets else (), "mcps_intersection": tuple(sorted(set.intersection(*mcp_sets))) if mcp_sets else (), "plugins_intersection": tuple(sorted(set.intersection(*plugin_sets))) if plugin_sets else (), "drift": drift, "in_sync": all(not v["missing_skills"] and not v["missing_mcps"] and not v["missing_plugins"] for v in drift.values())}
+
+class SessionHarnessFlagBuilder:
+    @classmethod
+    def detect_harness_family(cls, harness_name: str, backend: Any = None) -> str:
+        value = " ".join((harness_name, str(getattr(backend, "command", "")), str(getattr(backend, "kind", "")))).lower()
+        return next((x for x in ("claude", "codex", "copilot", "hermes") if x in value), "generic")
+
+    @classmethod
+    def build_for_candidate(cls, specialist: SpecialistDefinition | Any, harness_name: str, *, backend: Any = None) -> dict[str, Any]:
+        s = SpecialistDefinition.from_obj(specialist); d = Path(s.specialist_dir) if s.specialist_dir else None; family = cls.detect_harness_family(harness_name, backend)
+        agents = str(s.agents_md_path or (d / "AGENTS.md" if d else "")); mcp = str(d / "mcp.json") if d else ""; skills = str(d / "skills") if d else ""
+        ask=[x for x in s.skill_packs if x not in s.disabled_skills]; am=[x for x in s.mcp_servers if x not in s.disabled_mcp_servers]; dm=list(s.disabled_mcp_servers); ap=[x for x in s.plugins if x not in s.disabled_plugins]; dp=list(s.disabled_plugins); a=[]
+        if family == "claude":
+            if d: a += ["--add-dir", str(d)]
+            if s.strict_mcp_scope: a += ["--strict-mcp-config"]
+            if mcp and (am or s.strict_mcp_scope): a += ["--mcp-config", mcp]
+            for p in ap: a += ["--plugin-dir", str(d / "plugins" / p) if d else p]
+            if s.allowed_tools: a += ["--allowedTools", ",".join(s.allowed_tools)]
+            dis=list(s.denied_tools)+[f"mcp__{m}__*" for m in dm]+[f"Skill({sk})" for sk in s.disabled_skills]
+            if dis: a += ["--disallowedTools", ",".join(dis)]
+            if dp: a += ["--disable-plugin", ",".join(dp)]
+        elif family == "codex":
+            if skills: a += ["-c", f'skills.dirs=["{skills.replace(chr(92), "/")}"]']
+            if s.strict_mcp_scope: a += ["-c", "mcp_servers._strict_scope=true"]
+            for m in am: a += ["-c", f"mcp_servers.{m}.enabled=true"]
+            for m in dm: a += ["-c", f"mcp_servers.{m}.enabled=false"]
+            if s.disabled_skills: a += ["-c", f"skills.disabled={json.dumps(list(s.disabled_skills))}"]
+            if s.allowed_tools: a += ["-c", f"tools.allowed={json.dumps(list(s.allowed_tools))}"]
+            if s.denied_tools: a += ["-c", f"tools.denied={json.dumps(list(s.denied_tools))}"]
+            for p in ap: a += ["--enable", p]
+            for p in dp: a += ["--disable", p]
+        elif family == "copilot":
+            if d: a += ["--add-dir", str(d)]
+            if s.strict_mcp_scope: a += ["--disable-builtin-mcps"]
+            if mcp and am: a += ["--additional-mcp-config", "@"+mcp]
+            for m in am: a += ["--enable-mcp-server", m]
+            for m in dm: a += ["--disable-mcp-server", m]
+            for p in ap: a += ["--plugin-dir", str(d / "plugins" / p) if d else p]
+            if s.allowed_tools: a += ["--available-tools", ",".join(s.allowed_tools)]
+            excluded=list(s.denied_tools)+[f"mcp__{m}__*" for m in dm]+[f"Skill({sk})" for sk in s.disabled_skills]+[f"Plugin({p})" for p in dp]
+            if excluded: a += ["--excluded-tools", ",".join(excluded)]
+        elif family == "hermes":
+            if ask: a += ["-s", ",".join(ask)]
+            tools=list(s.allowed_tools)+[m if m.startswith("mcp-") else "mcp-"+m for m in am]
+            if tools: a += ["-t", ",".join(tools)]
+            if dp: a += ["--safe-mode"]
+            if s.strict_mcp_scope: a += ["--strict-mcp-scope"]
+            if dm: a += ["--disable-mcp", ",".join(dm)]
+            if s.denied_tools: a += ["--deny-tools", ",".join(s.denied_tools)]
+            if s.disabled_skills: a += ["--disable-skills", ",".join(s.disabled_skills)]
+        else:
+            if (s.strict_mcp_scope or dm or dp or s.denied_tools or s.disabled_skills) and not getattr(backend, "supports_session_isolation", False):
+                raise SkillContractViolationError(f"Harness {harness_name!r} (generic) cannot enforce requested specialist isolation policy")
+            if d: a += ["--add-dir", str(d)]
+            if mcp and am: a += ["--mcp-config", mcp]
+        return {"harness_family":family,"specialist_dir":str(d) if d else "","agents_md_path":agents,"session_mcp_config":mcp,"session_cli_args":tuple(a),"mcps_enabled":tuple(am),"mcps_disabled":tuple(dm),"plugins_enabled":tuple(ap),"plugins_disabled":tuple(dp),"skills_enabled":tuple(ask),"skills_disabled":tuple(s.disabled_skills)}
 
 
 class DirtyBaselineError(RuntimeError):
@@ -259,7 +567,7 @@ class PrematureCompletionError(RuntimeError):
     """Raised when an AcceptanceReceipt fails the RequirementTraceabilityGate."""
 
 
-class SkillContractViolationError(RuntimeError):
+class SkillContractViolationError(SubagentRetryableError):
     """Raised when a specialist omits required skill/tool/MCP execution evidence."""
 
 
@@ -393,8 +701,17 @@ class SkillAndToolReceiptGate:
                 "skill_evidence": skill_evidence,
             }
 
-        expected_packs = tuple(required_skill_packs) or (spec_def.skill_packs if spec_def is not None else ())
-        expected_mcps = tuple(required_mcps) or (spec_def.mcp_servers if spec_def is not None else ())
+        raw_expected_packs = tuple(required_skill_packs) or (spec_def.skill_packs if spec_def is not None else ())
+        raw_expected_mcps = tuple(required_mcps) or (spec_def.mcp_servers if spec_def is not None else ())
+        startup_skills = (set(spec_def.startup_skills) | (set(raw_expected_packs) & set(BUCKET1_STARTUP_SKILLS))) if spec_def is not None else set()
+        startup_mcps = (set(spec_def.startup_mcp_servers) | (set(raw_expected_mcps) & set(BUCKET1_STARTUP_MCPS))) if spec_def is not None else set()
+        expected_packs = tuple(p for p in raw_expected_packs if p not in startup_skills); expected_mcps = tuple(m for m in raw_expected_mcps if m not in startup_mcps)
+        if spec_def is not None and (startup_skills or startup_mcps):
+            chosen_obj = getattr(agent_backend, "last_chosen_backend_obj", None) or getattr(node, "last_chosen_backend_obj", None)
+            receipt = getattr(agent_backend, "startup_receipt", None) or getattr(chosen_obj, "startup_receipt", None) or getattr(node, "startup_receipt", None)
+            if receipt is None: raise SkillContractViolationError(f"Specialist on node '{getattr(node, 'id', '')}' failed closed: missing HarnessStartupReceipt for Bucket-1 startup artifacts skills={sorted(startup_skills)}, mcps={sorted(startup_mcps)}")
+            missing_s = tuple(s for s in sorted(startup_skills) if s not in receipt.installed_skills); missing_m = tuple(m for m in sorted(startup_mcps) if m not in receipt.installed_mcps)
+            if not receipt.ready or missing_s or missing_m: raise SkillContractViolationError(f"Harness {getattr(receipt, 'harness_name', '')!r} missing specialist startup assumption missing_skills={missing_s}, missing_mcps={missing_m}")
         expected_tools = tuple(required_tools) or tuple(getattr(agent_backend, "required_tools", ()) or ())
 
         if delivered_prompt and spec_def is not None and spec_def.has_specialist_bundle:
@@ -1918,7 +2235,7 @@ class DagSpecialistRuntime:
             )
 
 
-QueueStatus = Literal["enqueued", "routed", "decomposing", "running", "completed", "failed"]
+QueueStatus = Literal["enqueued", "routed", "decomposing", "running", "completed", "incomplete", "failed"]
 
 
 @dataclass(frozen=True)
@@ -2280,15 +2597,228 @@ class OmrDispatcher:
         history_root: Path | str,
         intake_router: Callable[[list[tuple[str, str]], str, str], Any] | None = None,
         charter_context: dict[str, Any] | None = None,
+        gate_policy_path: Path | str | None = None,
+        specialists_root: Path | str | None = None,
     ) -> None:
         self.table = table
         self.queue = queue
         self.workdir = Path(workdir)
         self.run_root = Path(run_root)
+        self.harnesses_root = self.run_root.parent / "harnesses"
+        self.harness_receipts: dict[str, HarnessStartupReceipt] = {}
+        self.specialists_root = Path(specialists_root) if specialists_root is not None else self.run_root.parent / "specialists"
         self.nodes_root = Path(nodes_root)
         self.history_root = Path(history_root)
         self.intake_router = intake_router
         self.charter_context = dict(charter_context) if charter_context else None
+        self.gate_policy = GatePolicy.load_default(gate_policy_path)
+        self.gate_log_path = self.run_root / "gate_log.json"
+        self.lessons_store = LessonsStore(self.history_root / "lessons.jsonl")
+
+    def onboard_harness(
+        self,
+        name: str,
+        backend: Any,
+        weight: float = 1.0,
+        max_failovers: int | None = None,
+        *, auto_install_startup: bool = True, required_startup_skills: Sequence[str] = BUCKET1_STARTUP_SKILLS, required_startup_mcps: Sequence[str] = BUCKET1_STARTUP_MCPS, required_startup_plugins: Sequence[str] = BUCKET1_STARTUP_PLUGINS, extra_skill_roots: Sequence[str | Path] = (),
+    ) -> int:
+        """Add a runtime harness to every routed specialist without profile setup."""
+        del weight
+        receipt = HarnessStartupManager.ensure_and_verify_harness(name, getattr(self, "harnesses_root", self.run_root.parent / "harnesses"), backend=backend, required_startup_skills=required_startup_skills, required_startup_mcps=required_startup_mcps, required_startup_plugins=required_startup_plugins, extra_skill_roots=extra_skill_roots, auto_install=auto_install_startup)
+        self.harness_receipts = getattr(self, "harness_receipts", {}); self.harness_receipts[name] = receipt
+        backends = getattr(self.table, "_backends", None) or getattr(self.table, "_b", {})
+        updated = 0
+        for routed in backends.values():
+            if not isinstance(routed, RoutingBackend):
+                continue
+            if any(target.name == name for target in routed._targets):
+                continue
+            routed._targets.append(RouteTarget(name, name, backend))
+            if max_failovers is not None:
+                routed._max_failovers = max(0, int(max_failovers))
+                routed._max_attempts = max(routed._max_attempts, 1 + routed._max_failovers)
+            updated += 1
+        self.decide_gate("technical_decision", f"onboard_harness:{name}")
+        return updated
+
+    def reconcile_harnesses(self, **kwargs: Any) -> dict[str, Any]:
+        backends = getattr(self.table, "_backends", None) or getattr(self.table, "_b", {}); unique: dict[str, Any] = {}
+        for routed in backends.values():
+            if isinstance(routed, RoutingBackend):
+                for target in routed._targets: unique.setdefault(target.name, target.backend)
+        return HarnessStartupManager.reconcile_harness_pool(unique, self.harnesses_root, **kwargs)
+
+    def onboard_specialist(
+        self,
+        name: str,
+        targets: list[RouteTarget] | Any,
+        max_failovers: int = 2,
+        max_attempts: int | None = None,
+        replace: bool = False,
+        specialist_definition: SpecialistDefinition | dict[str, Any] | Path | str | None = None,
+        specialists_root: Path | str | None = None,
+        require_skill_evidence: bool = False,
+    ) -> RoutingBackend:
+        """Register a profile-free specialist over an existing runtime harness pool."""
+        raw_targets = list(targets) if isinstance(targets, (list, tuple)) else [RouteTarget(name, name, targets)]
+        route_targets: list[RouteTarget] = []
+        seen_incoming: set[str] = set()
+        for target in raw_targets:
+            if target.name not in seen_incoming:
+                seen_incoming.add(target.name)
+                route_targets.append(target)
+        if not route_targets:
+            raise ValueError("A dynamic specialist requires at least one harness target")
+        for target in route_targets:
+            if getattr(target.backend, "startup_receipt", None) is None:
+                receipt = HarnessStartupManager.ensure_and_verify_harness(target.name, getattr(self, "harnesses_root", self.run_root.parent / "harnesses"), backend=target.backend, auto_install=True)
+                self.harness_receipts = getattr(self, "harness_receipts", {}); self.harness_receipts[target.name] = receipt
+        spec_def = SpecialistDefinition.from_obj(specialist_definition) if specialist_definition is not None else SpecialistDefinition(name=name)
+        if not spec_def.name:
+            spec_def = dataclass_replace(spec_def, name=name)
+        spec_def = SpecialistFolderManager.ensure_specialist_dir(spec_def, Path(specialists_root) if specialists_root is not None else getattr(self, "specialists_root", self.run_root.parent / "specialists"))
+        existing = None
+        getter = getattr(self.table, "backend", None)
+        if callable(getter):
+            try:
+                candidate = getter(name)
+            except (KeyError, ValueError, LookupError):
+                candidate = None
+            if isinstance(candidate, RoutingBackend):
+                existing = candidate
+        if existing is not None and not replace:
+            if specialist_definition is not None:
+                existing.specialist_definition = spec_def
+            if require_skill_evidence:
+                existing.require_skill_evidence = True
+            target_names = {target.name for target in existing._targets}
+            for target in route_targets:
+                if target.name not in target_names:
+                    target_names.add(target.name)
+                    existing._targets.append(target)
+            self.decide_gate("technical_decision", f"onboard_specialist:{name}")
+            return existing
+        instances = next(
+            (routed._instances for routed in getattr(self.table, "_backends", {}).values() if isinstance(routed, RoutingBackend)),
+            None,
+        )
+        if instances is None:
+            instances = next(
+                (routed._instances for routed in getattr(self.table, "_b", {}).values() if isinstance(routed, RoutingBackend)),
+                None,
+            )
+        if instances is None:
+            instances = type("_RuntimeInstances", (), {"list_instances": lambda self, kind=None: []})()
+        routed = RoutingBackend(
+            name,
+            SpecialistPlaceholderBackend(name),
+            route_targets,
+            instances=instances,
+            max_failovers=max_failovers,
+            max_attempts=max_attempts,
+            specialist_definition=spec_def,
+            is_dynamic_specialist=True,
+        )
+        routed.require_skill_evidence = bool(require_skill_evidence)
+        table_backends = getattr(self.table, "_backends", None)
+        if isinstance(table_backends, dict):
+            table_backends[name] = routed
+            rows = getattr(self.table, "_rows", None)
+            order = getattr(self.table, "_order", None)
+            if isinstance(rows, dict):
+                rows[name] = type("DynamicSpecialistRow", (), {
+                    "name": name, "description": name, "kind": "specialist", "enabled": True,
+                    "hidden": False, "is_harness": False,
+                })()
+                if isinstance(order, list) and name not in order:
+                    order.append(name)
+        else:
+            simple_backends = getattr(self.table, "_b", None)
+            if isinstance(simple_backends, dict):
+                simple_backends[name] = routed
+            elif callable(getattr(self.table, "onboard", None)):
+                self.table.onboard(name, backend=routed)
+            else:
+                raise TypeError("table does not support runtime registration")
+        self.decide_gate("technical_decision", f"onboard_specialist:{name}")
+        return routed
+
+    def triage_task(self, prompt: str, file_count_hint: int | None = None) -> TriageDecision:
+        return classify_triage_tier(prompt, file_count_hint)
+
+    def record_lesson(self, trigger: str, rule: str, source_task_id: str) -> None:
+        self.lessons_store.record_lesson(trigger, rule, source_task_id)
+
+    def run_council_consensus(self, task_id: str, votes: list[dict[str, Any]]) -> dict[str, Any]:
+        verdict = evaluate_council_consensus(votes)
+        payload = verdict.model_dump()
+        receipt_path = self.run_root / "council" / f"{task_id}.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(receipt_path, payload)
+        if verdict.merged_gaps:
+            self.decide_gate("plan_gap_fill", f"council_gaps:{task_id}:{len(verdict.merged_gaps)}")
+            for gap in verdict.merged_gaps:
+                self.lessons_store.record_lesson("council_gap", gap, task_id)
+        return payload
+
+    def execute_external_action(self, gate: str, detail: str, action_fn: Callable[[], Any]) -> Any:
+        self.require_gate(gate, detail)
+        return action_fn()
+
+    def git_push(self, detail: str, action_fn: Callable[[], Any]) -> Any:
+        return self.execute_external_action("push", detail, action_fn)
+
+    def publish_pr(self, detail: str, action_fn: Callable[[], Any]) -> Any:
+        return self.execute_external_action("publish", detail, action_fn)
+
+    def deploy(self, detail: str, action_fn: Callable[[], Any]) -> Any:
+        return self.execute_external_action("deploy", detail, action_fn)
+
+    def run_ambiguity_experiment(self, task_id: str, question: str, probe_fn: Callable[[], dict[str, Any]] | None = None) -> dict[str, Any]:
+        if probe_fn is not None:
+            finding = probe_fn()
+            resolved = bool(finding.get("resolved"))
+            receipt = {"task_id": task_id, "question": question, "resolved": resolved, "finding": finding, "verified": True, "exit_code": 0}
+            receipt_path = self.run_root / "experiments" / f"{task_id}.json"
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_json(receipt_path, receipt)
+            if resolved:
+                self.decide_gate("technical_decision", f"experiment_resolved:{task_id}")
+                return {"proceed": True, "resolved_by": "experiment", "receipt_path": str(receipt_path)}
+        return {"proceed": self.decide_gate("ambiguous_product_intent", question)}
+
+    async def submit_trivial_task(self, task_id: str, prompt: str, specialist: str | None = None) -> Any:
+        chosen = specialist or await self.route_intake_specialist(prompt, default="Manager")
+        try:
+            result = await self.dispatch_specialist_node(task_id, chosen, prompt)
+            if self.completion_status(str(result)) == "completed":
+                return {"status": "completed", "triage_tier": "trivial", "escalated": False, "result": result}
+        except BaseException:
+            pass
+        decision = escalate_triage_tier("trivial", "trivial specialist run failed or was incomplete")
+        self.decide_gate("technical_decision", f"triage_escalation:trivial->{decision.tier}")
+        result = await self.submit_task(task_id, prompt, lead_specialist=chosen)
+        status = self.queue.latest_by_task()[task_id].status
+        return {"status": status, "triage_tier": decision.tier, "escalated": True, "result": result}
+
+    def completion_status(self, result: str) -> QueueStatus:
+        """Return completed only when result contains evidence we can verify."""
+        return "completed" if has_verifiable_evidence(result, self.workdir) else "incomplete"
+
+    def decide_gate(self, gate: str, detail: str = "") -> bool:
+        """Record a gate decision; external/irreversible callers must use ``require_gate``."""
+        proceed = self.gate_policy.decide(gate, detail)
+        if self.gate_policy.log:
+            self.gate_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.gate_policy.persist_log(self.gate_log_path)
+        return proceed
+
+    def require_gate(self, gate: str, detail: str = "") -> bool:
+        """Require approval before push, publish, deploy, spend, or delete_remote actions."""
+        if not self.decide_gate(gate, detail):
+            raise PermissionError(f"Gate {gate!r} requires human approval ({detail})")
+        return True
 
     async def route_intake_specialist(self, prompt: str, *, default: str = "Manager") -> str:
         menu = [(row.name, row.description) for row in self.table.enabled() if not row.is_harness or row.kind == "specialist"]
@@ -2300,6 +2830,7 @@ class OmrDispatcher:
                 ans = await ans
             if isinstance(ans, str) and any(name == ans for name, _ in menu):
                 return ans
+        self.decide_gate("specialist_fallback", f"default={default}")
         for name, _ in menu:
             if name.lower() == default.lower():
                 return name
@@ -2378,6 +2909,7 @@ class OmrDispatcher:
 
         node_waves = plan.node_waves
         by_id = {n.id: n for n in plan.dag_spec.nodes}
+        node_outputs: dict[str, str] = {}
         for node in plan.dag_spec.nodes:
             self.queue.transition(
                 node.id,
@@ -2390,7 +2922,19 @@ class OmrDispatcher:
             resolved = self.table.backend(node.subagent, build=node)
             if resolved is not None and self.charter_context:
                 setattr(resolved, "charter_context", self.charter_context)
-            return resolved
+            if resolved is None:
+                return None
+
+            class _CapturingBackend:
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(resolved, name)
+
+                async def run(self, *args: Any, **kwargs: Any) -> Any:
+                    result = await resolved.run(*args, **kwargs)
+                    node_outputs[node.id] = str(result)
+                    return result
+
+            return _CapturingBackend()
 
         async def _on_node_start(nid: str) -> None:
             node_obj = by_id.get(nid)
@@ -2411,13 +2955,16 @@ class OmrDispatcher:
                     h_name = str(getattr(b_obj, "last_chosen_backend", "") or "")
                     self.queue.transition(
                         nid,
-                        "completed" if st == "completed" else "failed",
+                        self.completion_status(str(
+                            payload.get("output") or payload.get("result") or payload.get("summary")
+                            or node_outputs.get(nid, "")
+                        )) if st == "completed" else "failed",
                         assigned_specialist=node_obj.subagent,
                         assigned_harness=h_name,
                         wave=node_waves.get(nid, 0),
                     )
 
-        return await run_dag(
+        result = await run_dag(
             plan.dag_spec,
             resolve=_resolve_from_table,
             backend=LocalFileBackend(),
@@ -2432,6 +2979,26 @@ class OmrDispatcher:
             progress_publisher=_progress_pub,
             judge_node=judge_node or self._default_dag_judge,
         )
+        for file_entry in result.files:
+            nid = str(file_entry.get("node") or "")
+            if file_entry.get("status") != "completed" or nid not in by_id:
+                continue
+            output = file_entry.get("output") or file_entry.get("result") or file_entry.get("summary")
+            output = output or node_outputs.get(nid, "")
+            node_obj = by_id[nid]
+            backend_obj = self.table.backend(node_obj.subagent)
+            final_status = self.completion_status(str(output or ""))
+            prev = self.queue.latest_by_task().get(nid)
+            if prev is not None and prev.status == final_status:
+                continue
+            self.queue.transition(
+                nid,
+                final_status,
+                assigned_specialist=node_obj.subagent,
+                assigned_harness=str(getattr(backend_obj, "last_chosen_backend", "") or ""),
+                wave=node_waves.get(nid, 0),
+            )
+        return result
 
     async def dispatch_specialist_node(
         self,
@@ -2462,7 +3029,10 @@ class OmrDispatcher:
             raise DagValidationError(f"Specialist {specialist_name!r} not found in SubagentTable")
         self.queue.transition(task_id, "routed", assigned_specialist=specialist_name)
         self.queue.transition(task_id, "running", assigned_specialist=specialist_name)
-        framed_prompt = self._build_framed_prompt(prompt)
+        lessons = self.lessons_store.matching_lessons(prompt)
+        lessons_block = "\n".join(f"- {lesson['rule']}" for lesson in lessons)
+        lesson_prompt = f"{prompt}\n\n[Active Lessons]\n{lessons_block}" if lessons else prompt
+        framed_prompt = self._build_framed_prompt(lesson_prompt)
         try:
             result = await backend.run(
                 framed_prompt,
@@ -2492,10 +3062,12 @@ class OmrDispatcher:
             )
             self.queue.transition(
                 task_id,
-                "completed",
+                self.completion_status(str(result)),
                 assigned_specialist=specialist_name,
                 assigned_harness=chosen_harness,
             )
+            if self.completion_status(str(result)) == "incomplete":
+                self.record_lesson(prompt, "Provide verifiable done-gate evidence before completion.", task_id)
             return result
         except BaseException as exc:
             chosen_harness = str(getattr(backend, "last_chosen_backend", "") or getattr(backend, "name", "") or "")
@@ -2584,6 +3156,7 @@ class OmrDispatcher:
                 run_dir=run_dir,
                 workdir=self.workdir,
             )
+            self.decide_gate("technical_decision", f"decompose:{task_id}")
             self.queue.transition(
                 task_id,
                 "running",
@@ -2602,9 +3175,13 @@ class OmrDispatcher:
             if cleanup_worktrees:
                 self._cleanup_run_worktrees(effective_run_id)
 
+            latest = self.queue.latest_by_task()
+            children_done = all(
+                e.status == "completed" for e in latest.values() if e.parent_task_id == task_id
+            )
             self.queue.transition(
                 task_id,
-                "failed" if any_failed else "completed",
+                "failed" if any_failed else "completed" if children_done else "incomplete",
                 assigned_specialist=chosen_lead,
                 assigned_harness=chosen_mgr_harness,
             )
@@ -2648,6 +3225,10 @@ __all__ = [
     "OmrDispatcher",
     "OmrQueueEntry",
     "OmrTaskQueue",
+    "TriageDecision",
+    "classify_triage_tier",
+    "escalate_triage_tier",
+    "LessonsStore",
     "PrematureCompletionError",
     "QueueStatus",
     "RecoveryBlockedError",
@@ -2662,8 +3243,10 @@ __all__ = [
     "SkillContractViolationError",
     "SkillPackInjector",
     "SkillPackResolver",
+    "SessionHarnessFlagBuilder",
     "SliceReceipt",
     "SpecialistDefinition",
+    "SpecialistFolderManager",
     "SpecialistPlaceholderBackend",
     "StaleReviewError",
     "WorktreeManager",
