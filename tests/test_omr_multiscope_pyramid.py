@@ -591,3 +591,95 @@ class TestEndToEndGoldenSet:
         scores["s10"] = "[Active Lessons]" in learner.prompts[1]
 
         assert scores == {f"s{i}": True for i in range(1, 11)}
+
+
+class _ModelHarness:
+    """Records per-call session args; optionally raises."""
+
+    kind, streams = "cli", False
+
+    def __init__(self, name, models, exc=None):
+        self.name, self.supported_models, self.exc, self.args, self.calls = name, tuple(models), exc, [], 0
+
+    async def run(self, task, **kw):
+        self.calls += 1
+        self.args.append(list(kw.get("session_cli_args") or ()))
+        if self.exc is not None:
+            raise self.exc
+        return "done"
+
+
+def _read_telemetry(path: Path) -> list[dict]:
+    return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+
+class TestR24ModelConfig:
+    def _rb(self, tmp_path, h1, h2, cfg):
+        from oh_my_raven.oh_my_raven import SpecialistDefinition, SpecialistFolderManager
+        spec = SpecialistFolderManager.ensure_specialist_dir(
+            SpecialistDefinition(name="Modeler", model_config=cfg), tmp_path / "specialists")
+        tel = tmp_path / "specialist_telemetry.jsonl"
+        rb = RoutingBackend(h1.name, h1, [RouteTarget(h2.name, h2.name, h2)],
+                            instances=_Inst(), cooldown_s=0, specialist_definition=spec, telemetry_path=tel)
+        return rb, tel
+
+    @staticmethod
+    def _cfg():
+        from oh_my_raven.oh_my_raven import SpecialistModelConfig
+        return SpecialistModelConfig(preferred_models=("claude-sonnet-4-6",), fallback_models=("gpt-5.4",),
+                                     reasoning_effort="high")
+
+    def test_r24_catalog_aware_model_failover_and_reviewer_family_separation(self, tmp_path):
+        from oh_my_raven.oh_my_raven import (
+            CommandReceipt, ExecutionIdentity, IndependentReviewError, ReviewGateValidator, ReviewReceipt,
+            SpecialistModelConfig, SessionHarnessFlagBuilder, SpecialistDefinition,
+        )
+        from oh_my_raven.routing import SubagentRetryableError
+
+        # A: catalog/availability failover on unsupported model
+        a_dir = tmp_path / "a"
+        a_dir.mkdir()
+        h1, h2 = _ModelHarness("Claude-Code", ("claude-3-haiku",)), _ModelHarness("Codex-CLI", ("gpt-5.4",))
+        rb, tel = self._rb(a_dir, h1, h2, self._cfg())
+        asyncio.run(rb.run("task", task_id="1", workspace=Path("."), executor=None))
+        assert h1.calls == 0 and h2.calls == 1
+        assert "-m" in h2.args[0] and "gpt-5.4" in h2.args[0] and 'model_reasoning_effort="high"' in h2.args[0]
+        assert rb.last_resolved_model == "gpt-5.4"
+        rec = _read_telemetry(tel)[-1]
+        assert (rec["resolved_model"], rec["canonical_model"], rec["reasoning_effort"]) == ("gpt-5.4", "gpt-5.4", "high")
+        assert rec["model_fallback_used"] is True and rec["attempt_count"] == 2
+
+        # B: in-loop quota failover on preferred model
+        b_dir = tmp_path / "b"
+        b_dir.mkdir()
+        h1 = _ModelHarness("Claude-Code", ("claude-sonnet-4-6",),
+                           SubagentRetryableError("429 rate limit exceeded for model claude-sonnet-4-6"))
+        h2 = _ModelHarness("Codex-CLI", ("claude-sonnet-4-6", "gpt-5.4"))
+        rb, tel = self._rb(b_dir, h1, h2, self._cfg())
+        asyncio.run(rb.run("task", task_id="1", workspace=Path("."), executor=None))
+        assert h1.calls == 1 and h2.calls == 1
+        assert "claude-sonnet-4-6" in h1.args[0] and "gpt-5.4" in h2.args[0]
+        assert rb.last_resolved_model == "gpt-5.4"
+        assert _read_telemetry(tel)[-1]["model_fallback_used"] is True
+
+        # C: reviewer cross-family enforcement
+        author = ExecutionIdentity(agent_name="Engineer", harness_kind="claude", executable_or_endpoint="claude",
+                                   model="custom/gh/claude-sonnet-4.6")
+        reviewer_cfg = SpecialistModelConfig(preferred_models=("claude-sonnet-4-6", "gpt-5.4"),
+                                             require_distinct_model_family_from_author=True)
+        res = reviewer_cfg.resolve_for_candidate("Copilot-CLI", harness_family="copilot",
+                                                 author_models=("custom/gh/claude-sonnet-4.6",))
+        assert res["canonical_model"] == "gpt-5.4" and res["model_family"] == "gpt"
+        assert any("author_family_conflict:claude" in r for r in res["rejection_reasons"])
+        bundle = SessionHarnessFlagBuilder.build_for_candidate(
+            SpecialistDefinition(name="Reviewer", model_config=reviewer_cfg), "Copilot-CLI",
+            author_models=("custom/gh/claude-sonnet-4.6",))
+        assert bundle["resolved_model_family"] == "gpt"
+        same_family = ExecutionIdentity(agent_name="Reviewer", harness_kind="copilot",
+                                        executable_or_endpoint="Copilot-CLI", model="custom/gh/claude-sonnet-4.6",
+                                        require_distinct_model_family_from_author=True)
+        with pytest.raises(IndependentReviewError):
+            ReviewGateValidator().verify_review_receipt(
+                ReviewReceipt(verdict="approved", reviewed_head_sha="abc", findings=[],
+                              commands=[CommandReceipt("pytest", 0)], reviewer_identity=same_family),
+                candidate_head_sha="abc", reviewer_backend=same_family, author_backends=[author])
