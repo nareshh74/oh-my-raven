@@ -1279,8 +1279,11 @@ class RoutingBackend(SubagentBackend):
             **telemetry_extra,
         )
         summary = ", ".join(f"{r['backend']}:{r['error_class']}" for r in attempt_records)
+        if last_exc is not None and type(last_exc).__name__ == "SkillContractViolationError":
+            raise last_exc
+        detail = f": {last_exc}" if last_exc is not None else ""
         raise SubagentFailoverExhaustedError(
-            f"{self.name!r}: all {len(attempt_records)} failover attempts failed ({summary})",
+            f"{self.name!r}: all {len(attempt_records)} failover attempts failed ({summary}){detail}",
             attempts=attempt_records,
         ) from last_exc
 
