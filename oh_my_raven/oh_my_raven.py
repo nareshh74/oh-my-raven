@@ -456,7 +456,9 @@ class HarnessStartupManager:
 
     @classmethod
     def reconcile_harness_pool(cls, harnesses: Mapping[str, Any] | Sequence[tuple[str, Any]], harness_root: Path | str, **kwargs: Any) -> dict[str, Any]:
-        items = harnesses.items() if isinstance(harnesses, Mapping) else harnesses; receipts = {n: cls.ensure_and_verify_harness(n, harness_root, backend=b, **kwargs) for n, b in items}
+        raw_items = harnesses.items() if isinstance(harnesses, Mapping) else harnesses
+        items = [(x, None) if isinstance(x, str) else tuple(x) for x in raw_items]
+        receipts = {n: cls.ensure_and_verify_harness(n, harness_root, backend=b, **kwargs) for n, b in items}
         skill_sets = [set(r.installed_skills) for r in receipts.values()]; mcp_sets = [set(r.installed_mcps) for r in receipts.values()]
         su = set().union(*skill_sets) if skill_sets else set(); mu = set().union(*mcp_sets) if mcp_sets else set()
         drift = {n: {"missing_skills": sorted(su - set(r.installed_skills)), "missing_mcps": sorted(mu - set(r.installed_mcps))} for n, r in receipts.items()}
