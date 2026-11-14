@@ -21,6 +21,8 @@ from oh_my_raven.oh_my_raven import (
     SkillContractViolationError,
     SpecialistDefinition,
     SpecialistFolderManager,
+    SpecialistModelConfig,
+    infer_model_family,
 )
 
 
@@ -430,3 +432,65 @@ def test_reconcile_harness_pool_eliminates_bucket1_drift(tmp_path):
     res = HarnessStartupManager.reconcile_harness_pool(names, tmp_path / "harnesses")
     assert res["in_sync"] is True
     assert set(BUCKET1_STARTUP_SKILLS) <= set(res["skills_intersection"])
+
+
+def _rich_model_config():
+    return SpecialistModelConfig(
+        preferred_models=("claude-sonnet-4-6",),
+        fallback_models=("gpt-5.4", "gemini-2.5-pro"),
+        model_tier="frontier",
+        reasoning_effort="high",
+        disallowed_models=("claude-3-haiku*",),
+        require_distinct_model_family_from_author=True,
+        model_aliases={
+            "claude-sonnet-4-6": {"claude": "claude-sonnet-4-6", "copilot": "custom/gh/claude-sonnet-4.6",
+                                  "hermes": "custom/gh/claude-sonnet-4.6"},
+            "gpt-5.4": {"codex": "gpt-5.4", "copilot": "custom/gh/gpt-5.4", "hermes": "custom/gh/gpt-5.4"},
+        },
+    )
+
+
+def _model_specialist(tmp_path):
+    spec = SpecialistDefinition(name="Modeler", model_config=_rich_model_config())
+    return SpecialistFolderManager.ensure_specialist_dir(spec, tmp_path / "specialists")
+
+
+def test_specialist_model_config_roundtrip_and_artifact_materialization(tmp_path):
+    mat = _model_specialist(tmp_path)
+    sdir = Path(mat.specialist_dir)
+    assert json.loads((sdir / "model_config.json").read_text(encoding="utf-8")) == _rich_model_config().to_dict()
+    text = (sdir / "AGENTS.md").read_text(encoding="utf-8")
+    assert "model_config" in text and "## Model Config" in text and "claude-sonnet-4-6" in text
+    loaded = SpecialistDefinition.from_agents_md(sdir)
+    for f in ("preferred_models", "fallback_models", "model_tier", "reasoning_effort", "disallowed_models",
+              "require_distinct_model_family_from_author", "model_aliases"):
+        assert getattr(loaded.model_config, f) == getattr(_rich_model_config(), f), f
+    assert loaded.model_config == _rich_model_config()
+    assert infer_model_family("custom/gh/claude-sonnet-4.6") == "claude"
+    assert infer_model_family("openai/gpt-5.4") == "gpt"
+    assert infer_model_family("gemini-2.5-pro") == "gemini"
+    assert infer_model_family("llama-3o4") == "llama"
+    assert infer_model_family("o3-mini") == "gpt"
+    assert infer_model_family("foo1") == "foo1"
+
+
+def test_session_harness_flag_builder_model_config_all_harnesses_and_acp(tmp_path):
+    mat = _model_specialist(tmp_path)
+    build = SessionHarnessFlagBuilder.build_for_candidate
+    c = list(build(mat, "Claude-Code")["session_cli_args"])
+    assert c[c.index("--model") + 1] == "claude-sonnet-4-6" and c[c.index("--effort") + 1] == "high"
+    x = build(mat, "Codex-CLI", supported_models=("gpt-5.4",))
+    assert x["model_fallback_used"] is True and x["resolved_model"] == "gpt-5.4"
+    xa = list(x["session_cli_args"])
+    assert xa[xa.index("-m") + 1] == "gpt-5.4" and 'model_reasoning_effort="high"' in xa
+    p = list(build(mat, "Copilot-CLI")["session_cli_args"])
+    assert p[p.index("--model") + 1] == "custom/gh/claude-sonnet-4.6" and p[p.index("--reasoning-effort") + 1] == "high"
+    h = list(build(mat, "Hermes-CLI")["session_cli_args"])
+    assert h[h.index("-m") + 1] == "custom/gh/claude-sonnet-4.6" and h[h.index("--reasoning-effort") + 1] == "high"
+    acp = build(mat, "Windsurf-ACP", backend=SimpleNamespace(kind="acp", supports_session_isolation=True))
+    for k in ("session/new", "session/set_model"):
+        assert acp["acp_session_params"][k] == {"model": "claude-sonnet-4-6", "reasoning_effort": "high"}
+    with pytest.raises(SkillContractViolationError):
+        build(mat, "Codex-CLI", supported_models=("llama-3",))
+    with pytest.raises(SkillContractViolationError):
+        build(mat, "Claude-Code", supported_models=("claude-sonnet-4-6",), author_models=("claude-opus-4-6",))

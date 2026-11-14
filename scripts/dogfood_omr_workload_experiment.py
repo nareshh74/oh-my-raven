@@ -26,7 +26,7 @@ import conftest  # noqa: E402,F401  (aliases raven.agent.subagent.* to this repo
 from opentelemetry import trace as otel_trace  # noqa: E402
 
 from oh_my_raven.oh_my_raven import (  # noqa: E402
-    OmrDispatcher, OmrTaskQueue, SpecialistDefinition, WorktreeManager,
+    OmrDispatcher, OmrTaskQueue, SpecialistDefinition, SpecialistModelConfig, WorktreeManager,
 )
 from oh_my_raven.routing import RouteTarget, RoutingBackend  # noqa: E402
 
@@ -294,7 +294,8 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
             a = list(kw.get("session_cli_args") or ())
             seen["claude_flags_ok"] = ("--add-dir" in a and "--strict-mcp-config" in a and "--mcp-config" in a
                                        and "--allowedTools" in a and "--disallowedTools" in a
-                                       and any("mcp__github__*" in x for x in a))
+                                       and any("mcp__github__*" in x for x in a)
+                                       and "--model" in a and "claude-sonnet-4-6" in a and "--effort" in a and "high" in a)
             return json.dumps({"invoked_mcps": [], "skill_evidence": {}})
 
         def codex(s, task, kw):
@@ -302,9 +303,12 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
             seen["codex_flags_ok"] = ("-c" in a and any(x.startswith("skills.dirs=") for x in a)
                                       and "mcp_servers.codebase-memory.enabled=true" in a
                                       and "mcp_servers.github.enabled=false" in a
-                                      and "--enable" in a and "--disable" in a)
+                                      and "--enable" in a and "--disable" in a
+                                      and "-m" in a and ("gpt-5.4" in a or "claude-sonnet-4-6" in a)
+                                      and any('model_reasoning_effort="high"' in x for x in a))
             sdir = Path(kw["specialist_dir"])
-            seen["folder_ok"] = (sdir / "AGENTS.md").is_file() and (sdir / "mcp.json").is_file()
+            seen["folder_ok"] = ((sdir / "AGENTS.md").is_file() and (sdir / "mcp.json").is_file()
+                                 and (sdir / "model_config.json").is_file())
             r = subprocess.run([sys.executable, str(sdir / "skills" / "superpowers" / "scripts" / "check_arch.py")],
                                capture_output=True, text=True, check=True)
             (wt / "arch_ok.txt").write_text("ok", encoding="utf-8")
@@ -321,7 +325,12 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
                                     skill_dirs=(str(pack.parent),), mcp_servers=("codebase-memory",),
                                     disabled_mcp_servers=("github",), strict_mcp_scope=True,
                                     plugins=("omr-guard",), disabled_plugins=("noisy-plugin",),
-                                    allowed_tools=("read_file",), denied_tools=("rm",))
+                                    allowed_tools=("read_file",), denied_tools=("rm",),
+                                    model_config=SpecialistModelConfig(
+                                        preferred_models=("claude-sonnet-4-6",), fallback_models=("gpt-5.4",),
+                                        model_tier="frontier", reasoning_effort="high",
+                                        model_aliases={"claude-sonnet-4-6": {"claude": "claude-sonnet-4-6"},
+                                                       "gpt-5.4": {"codex": "gpt-5.4"}}))
         claude_b, codex_b = Stub("Claude-Code", claude), Stub("Codex-CLI", codex)
         d.onboard_harness("Claude-Code", claude_b)
         d.onboard_harness("Codex-CLI", codex_b)
@@ -341,7 +350,10 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
                   "disabled_mcp_servers", "strict_mcp_scope", "plugins", "disabled_plugins",
                   "allowed_tools", "denied_tools")
         loaded = SpecialistDefinition.from_agents_md(sdir) if created else None
-        loaded_ok = bool(created and all(getattr(loaded, f) == getattr(sdef, f) for f in fields))
+        loaded_ok = bool(created and all(getattr(loaded, f) == getattr(sdef, f) for f in fields)
+                         and loaded.model_config == sdef.model_config)
+        mc_ok = bool(sdir and (sdir / "model_config.json").is_file() and loaded and loaded.model_config == sdef.model_config
+                     and rb.last_resolved_model)
         first_err = rb.last_attempts[0].get("error_class")
         chosen = str(rb.last_chosen_backend)
         clean = git(wt, "status", "--porcelain", "-uall") == "" and not (wt / "AGENTS.md").exists()
@@ -352,10 +364,10 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
                   and not (sdir / "skills" / "andrej-karpathy-skill").exists()
                   and (Path(claude_b.harness_home) / "skills" / "andrej-karpathy-skill" / "SKILL.md").is_file())
         return {"ok": bool(created and loaded_ok and cf and xf and seen.get("folder_ok") and b1 and gs
-                           and first_err == "SkillContractViolationError" and chosen == "Codex-CLI" and clean),
+                           and first_err == "SkillContractViolationError" and chosen == "Codex-CLI" and clean and mc_ok),
                 "bucket1_reconciled": b1, "gstack_in_bucket2": gs,
                 "specialist_dir_created": created, "agents_md_loaded": loaded_ok, "claude_flags_ok": cf,
-                "codex_flags_ok": xf, "first_attempt_error": first_err,
+                "codex_flags_ok": xf, "model_config_ok": mc_ok, "first_attempt_error": first_err,
                 "chosen_backend": chosen, "worktree_clean": clean}
     timed("W7_per_specialist_folder_agents_md_and_session_flag_failover", w7)
 

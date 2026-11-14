@@ -591,3 +591,137 @@ class TestEndToEndGoldenSet:
         scores["s10"] = "[Active Lessons]" in learner.prompts[1]
 
         assert scores == {f"s{i}": True for i in range(1, 11)}
+
+
+class _ModelHarness:
+    """Records per-call session args; optionally raises."""
+
+    kind, streams = "cli", False
+
+    def __init__(self, name, models, exc=None):
+        self.name, self.supported_models, self.exc, self.args, self.calls = name, tuple(models), exc, [], 0
+
+    async def run(self, task, **kw):
+        self.calls += 1
+        self.args.append(list(kw.get("session_cli_args") or ()))
+        if self.exc is not None:
+            raise self.exc
+        return "done"
+
+
+def _read_telemetry(path: Path) -> list[dict]:
+    return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+
+class TestR24ModelConfig:
+    def _rb(self, tmp_path, h1, h2, cfg):
+        from oh_my_raven.oh_my_raven import SpecialistDefinition, SpecialistFolderManager
+        spec = SpecialistFolderManager.ensure_specialist_dir(
+            SpecialistDefinition(name="Modeler", model_config=cfg), tmp_path / "specialists")
+        tel = tmp_path / "specialist_telemetry.jsonl"
+        rb = RoutingBackend(h1.name, h1, [RouteTarget(h2.name, h2.name, h2)],
+                            instances=_Inst(), cooldown_s=0, specialist_definition=spec, telemetry_path=tel)
+        return rb, tel
+
+    @staticmethod
+    def _cfg():
+        from oh_my_raven.oh_my_raven import SpecialistModelConfig
+        return SpecialistModelConfig(preferred_models=("claude-sonnet-4-6",), fallback_models=("gpt-5.4",),
+                                     reasoning_effort="high")
+
+    def test_r24_catalog_aware_model_failover_and_reviewer_family_separation(self, tmp_path):
+        from oh_my_raven.oh_my_raven import (
+            CommandReceipt, ExecutionIdentity, IndependentReviewError, ReviewGateValidator, ReviewReceipt,
+            SpecialistModelConfig, SessionHarnessFlagBuilder, SpecialistDefinition,
+        )
+        from oh_my_raven.routing import SubagentRetryableError
+
+        # A: catalog/availability failover on unsupported model
+        a_dir = tmp_path / "a"
+        a_dir.mkdir()
+        h1, h2 = _ModelHarness("Claude-Code", ("claude-3-haiku",)), _ModelHarness("Codex-CLI", ("gpt-5.4",))
+        rb, tel = self._rb(a_dir, h1, h2, self._cfg())
+        asyncio.run(rb.run("task", task_id="1", workspace=Path("."), executor=None))
+        assert h1.calls == 0 and h2.calls == 1
+        assert "-m" in h2.args[0] and "gpt-5.4" in h2.args[0] and 'model_reasoning_effort="high"' in h2.args[0]
+        assert rb.last_resolved_model == "gpt-5.4"
+        rec = _read_telemetry(tel)[-1]
+        assert (rec["resolved_model"], rec["canonical_model"], rec["reasoning_effort"]) == ("gpt-5.4", "gpt-5.4", "high")
+        assert rec["model_fallback_used"] is True and rec["attempt_count"] == 2
+
+        # B: in-loop quota failover on preferred model
+        b_dir = tmp_path / "b"
+        b_dir.mkdir()
+        h1 = _ModelHarness("Claude-Code", ("claude-sonnet-4-6",),
+                           SubagentRetryableError("429 rate limit exceeded for model claude-sonnet-4-6"))
+        h2 = _ModelHarness("Codex-CLI", ("claude-sonnet-4-6", "gpt-5.4"))
+        rb, tel = self._rb(b_dir, h1, h2, self._cfg())
+        asyncio.run(rb.run("task", task_id="1", workspace=Path("."), executor=None))
+        assert h1.calls == 1 and h2.calls == 1
+        assert "claude-sonnet-4-6" in h1.args[0] and "gpt-5.4" in h2.args[0]
+        assert rb.last_resolved_model == "gpt-5.4"
+        assert _read_telemetry(tel)[-1]["model_fallback_used"] is True
+
+        # C: reviewer cross-family enforcement
+        author = ExecutionIdentity(agent_name="Engineer", harness_kind="claude", executable_or_endpoint="claude",
+                                   model="custom/gh/claude-sonnet-4.6")
+        reviewer_cfg = SpecialistModelConfig(preferred_models=("claude-sonnet-4-6", "gpt-5.4"),
+                                             require_distinct_model_family_from_author=True)
+        res = reviewer_cfg.resolve_for_candidate("Copilot-CLI", harness_family="copilot",
+                                                 author_models=("custom/gh/claude-sonnet-4.6",))
+        assert res["canonical_model"] == "gpt-5.4" and res["model_family"] == "gpt"
+        assert any("author_family_conflict:claude" in r for r in res["rejection_reasons"])
+        bundle = SessionHarnessFlagBuilder.build_for_candidate(
+            SpecialistDefinition(name="Reviewer", model_config=reviewer_cfg), "Copilot-CLI",
+            author_models=("custom/gh/claude-sonnet-4.6",))
+        assert bundle["resolved_model_family"] == "gpt"
+        same_family = ExecutionIdentity(agent_name="Reviewer", harness_kind="copilot",
+                                        executable_or_endpoint="Copilot-CLI", model="custom/gh/claude-sonnet-4.6",
+                                        require_distinct_model_family_from_author=True)
+        with pytest.raises(IndependentReviewError):
+            ReviewGateValidator().verify_review_receipt(
+                ReviewReceipt(verdict="approved", reviewed_head_sha="abc", findings=[],
+                              commands=[CommandReceipt("pytest", 0)], reviewer_identity=same_family),
+                candidate_head_sha="abc", reviewer_backend=same_family, author_backends=[author])
+
+    def test_r24_identity_preserved_nonquota_contract_error_and_reraise(self, tmp_path):
+        from oh_my_raven.oh_my_raven import ExecutionIdentity, SkillContractViolationError
+
+        # (a) pre-configured backend identity preserved + enriched; per-attempt reset
+        class _IdHarness(_ModelHarness):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.execution_identity = ExecutionIdentity(
+                    agent_name="X", harness_kind="cli", executable_or_endpoint="x", model="stale")
+
+        a_dir = tmp_path / "a"
+        a_dir.mkdir()
+        h1, h2 = _IdHarness("Claude-Code", ("claude-sonnet-4-6",)), _ModelHarness("Codex-CLI", ("gpt-5.4",))
+        rb, _ = self._rb(a_dir, h1, h2, self._cfg())
+        asyncio.run(rb.run("t", task_id="1", workspace=Path("."), executor=None))
+        assert rb.execution_identity.agent_name == "X"
+        assert rb.execution_identity.model == "claude-sonnet-4-6"
+        assert rb.last_resolved_model == "claude-sonnet-4-6"
+        h1.supported_models = ("claude-3-haiku",)
+        asyncio.run(rb.run("t", task_id="2", workspace=Path("."), executor=None))
+        assert rb.last_resolved_model == "gpt-5.4"
+        assert getattr(rb, "execution_identity", None) is None or rb.execution_identity.model == "gpt-5.4"
+
+        # (b) non-quota contract error mentioning "model" does not burn preferred model
+        b_dir = tmp_path / "b"
+        b_dir.mkdir()
+        h1 = _ModelHarness("Claude-Code", ("claude-sonnet-4-6", "gpt-5.4"),
+                           SkillContractViolationError("missing skill evidence for model_validator pack"))
+        h2 = _ModelHarness("Codex-CLI", ("claude-sonnet-4-6", "gpt-5.4"))
+        rb, _ = self._rb(b_dir, h1, h2, self._cfg())
+        asyncio.run(rb.run("t", task_id="1", workspace=Path("."), executor=None))
+        assert "claude-sonnet-4-6" in h2.args[0] and "gpt-5.4" not in h2.args[0]
+
+        # (c) all fail -> SkillContractViolationError re-raised
+        c_dir = tmp_path / "c"
+        c_dir.mkdir()
+        e = SkillContractViolationError("missing skill evidence")
+        h1, h2 = _ModelHarness("Claude-Code", ("claude-sonnet-4-6",), e), _ModelHarness("Codex-CLI", ("gpt-5.4",), e)
+        rb, _ = self._rb(c_dir, h1, h2, self._cfg())
+        with pytest.raises(SkillContractViolationError):
+            asyncio.run(rb.run("t", task_id="1", workspace=Path("."), executor=None))
