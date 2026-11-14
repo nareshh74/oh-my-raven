@@ -1161,7 +1161,7 @@ class RoutingBackend(SubagentBackend):
             self._inflight_counts[candidate.name] = int(self._inflight_counts.get(candidate.name, 0)) + 1
             self._dispatch_counts[candidate.name] = int(self._dispatch_counts.get(candidate.name, 0)) + 1
             try:
-                for attr in ("last_skill_evidence", "last_invoked_tools", "last_invoked_mcps"):
+                for attr in ("last_skill_evidence", "last_invoked_tools", "last_invoked_mcps", "last_review_receipt", "last_cto_strategic_brief", "last_cto_brief", "last_consequence_matrix"):
                     if hasattr(self, attr):
                         try:
                             delattr(self, attr)
