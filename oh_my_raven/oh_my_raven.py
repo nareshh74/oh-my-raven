@@ -34,8 +34,9 @@ def infer_model_family(model_id: str) -> str:
     token = str(model_id or "").strip().lower()
     for prefix in ("custom/gh/", "custom/ghe-copilot/", "gh/", "ghe-copilot/", "anthropic/", "openai/", "google/", "openrouter/", "copilot/", "xai/", "meta/", "deepseek/", "mistral/", "qwen/"):
         if token.startswith(prefix): token = token[len(prefix):]; break
-    for family, needles in (("claude", ("claude", "sonnet", "opus", "haiku")), ("gpt", ("gpt-", "gpt4", "gpt5", "gpt6", "o1", "o3", "o4", "codex")), ("gemini", ("gemini",)), ("grok", ("grok",)), ("deepseek", ("deepseek",)), ("llama", ("llama",)), ("qwen", ("qwen",)), ("mistral", ("mistral", "codestral"))):
+    for family, needles in (("llama", ("llama",)), ("deepseek", ("deepseek",)), ("qwen", ("qwen",)), ("mistral", ("mistral", "codestral")), ("gemini", ("gemini",)), ("grok", ("grok",)), ("claude", ("claude", "sonnet", "opus", "haiku")), ("gpt", ("gpt-", "gpt4", "gpt5", "gpt6", "codex"))):
         if any(n in token for n in needles): return family
+    if re.search(r"(?:^|[-_/.])(o1|o3|o4)(?:$|[-_/.0-9])", token): return "gpt"
     return re.split(r"[-_/:.]", token)[0] if token else ""
 
 @dataclass(frozen=True)

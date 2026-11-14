@@ -469,6 +469,9 @@ def test_specialist_model_config_roundtrip_and_artifact_materialization(tmp_path
     assert infer_model_family("custom/gh/claude-sonnet-4.6") == "claude"
     assert infer_model_family("openai/gpt-5.4") == "gpt"
     assert infer_model_family("gemini-2.5-pro") == "gemini"
+    assert infer_model_family("llama-3o4") == "llama"
+    assert infer_model_family("o3-mini") == "gpt"
+    assert infer_model_family("foo1") == "foo1"
 
 
 def test_session_harness_flag_builder_model_config_all_harnesses_and_acp(tmp_path):

@@ -768,7 +768,7 @@ class RoutingBackend(SubagentBackend):
                 return str(target.model)
         if kwargs.get("model"):
             return str(kwargs["model"])
-        return str(getattr(backend, "model", "") or "")
+        return str(getattr(backend, "model", "") or "") or str(getattr(self, "last_resolved_model", "") or "")
 
     def _check_dirty_worktree(self, workspace: Path) -> list[str]:
         if self._worktree_dirty_check is not None:
@@ -1170,6 +1170,16 @@ class RoutingBackend(SubagentBackend):
             self._inflight_counts[candidate.name] = int(self._inflight_counts.get(candidate.name, 0)) + 1
             self._dispatch_counts[candidate.name] = int(self._dispatch_counts.get(candidate.name, 0)) + 1
             try:
+                for attr in ("last_resolved_model", "last_canonical_model", "last_resolved_provider", "last_resolved_model_family", "last_reasoning_effort", "last_session_flags"):
+                    for obj in (self, candidate.backend):
+                        if hasattr(obj, attr):
+                            try:
+                                delattr(obj, attr)
+                            except (AttributeError, TypeError):
+                                try:
+                                    setattr(obj, attr, None)
+                                except (AttributeError, TypeError):
+                                    pass
                 if self.specialist_definition is not None:
                     from raven.agent.subagent.oh_my_raven import SessionHarnessFlagBuilder
                     session_bundle = SessionHarnessFlagBuilder.build_for_candidate(self.specialist_definition, candidate.name, backend=candidate.backend, author_models=call_kwargs.get("author_models") or getattr(self, "author_models", ()), author_families=call_kwargs.get("author_families") or getattr(self, "author_families", ()), excluded_models=tuple(failed_models_for_run))
@@ -1178,7 +1188,7 @@ class RoutingBackend(SubagentBackend):
                 for key in ("specialist_dir", "agents_md_path", "session_cli_args", "session_mcp_config", "resolved_model", "canonical_model", "resolved_provider", "reasoning_effort", "acp_session_params"):
                     if session_bundle.get(key): session_kwargs.update(optional_keyword(candidate.backend, key, session_bundle[key]))
                 if session_bundle.get("resolved_model") and "model" not in call_kwargs: session_kwargs.update(optional_keyword(candidate.backend, "model", session_bundle["resolved_model"]))
-                for attr in ("last_skill_evidence", "last_invoked_tools", "last_invoked_mcps", "last_review_receipt", "last_cto_strategic_brief", "last_cto_brief", "last_consequence_matrix"):
+                for attr in ("last_skill_evidence", "last_invoked_tools", "last_invoked_mcps", "last_review_receipt", "last_cto_strategic_brief", "last_cto_brief", "last_consequence_matrix", "execution_identity"):
                     if hasattr(self, attr):
                         try:
                             delattr(self, attr)
@@ -1212,7 +1222,7 @@ class RoutingBackend(SubagentBackend):
                     mc = spec_obj.model_config if spec_obj is not None else None
                     existing_id = getattr(self, "execution_identity", None)
                     if isinstance(existing_id, ExecutionIdentity):
-                        self.execution_identity = dataclass_replace(existing_id, model=existing_id.model or str(session_bundle.get("resolved_model", "") or ""), provider=existing_id.provider or str(session_bundle.get("resolved_provider", "") or ""), model_family=existing_id.model_family or str(session_bundle.get("resolved_model_family", "") or ""), reasoning_effort=existing_id.reasoning_effort or str(session_bundle.get("reasoning_effort", "") or ""), require_distinct_model_family_from_author=existing_id.require_distinct_model_family_from_author or bool(mc and mc.require_distinct_model_family_from_author), disallowed_models=existing_id.disallowed_models or (mc.disallowed_models if mc else ()))
+                        self.execution_identity = dataclass_replace(existing_id, model=str(session_bundle.get("resolved_model", "") or existing_id.model), provider=str(session_bundle.get("resolved_provider", "") or existing_id.provider), model_family=str(session_bundle.get("resolved_model_family", "") or existing_id.model_family), reasoning_effort=str(session_bundle.get("reasoning_effort", "") or existing_id.reasoning_effort), require_distinct_model_family_from_author=bool(mc.require_distinct_model_family_from_author) if mc else existing_id.require_distinct_model_family_from_author, disallowed_models=(mc.disallowed_models if mc else existing_id.disallowed_models))
                     elif mc and mc.is_configured:
                         self.execution_identity = ExecutionIdentity(agent_name=candidate.name, harness_kind=str(session_bundle.get("harness_family", "") or ""), executable_or_endpoint=candidate.name, model=str(session_bundle.get("resolved_model", "") or ""), provider=str(session_bundle.get("resolved_provider", "") or ""), model_family=str(session_bundle.get("resolved_model_family", "") or ""), reasoning_effort=str(session_bundle.get("reasoning_effort", "") or ""), require_distinct_model_family_from_author=mc.require_distinct_model_family_from_author, disallowed_models=mc.disallowed_models)
                 require_ev = bool(call_kwargs.get("require_skill_evidence", False) or getattr(self, "require_skill_evidence", False) or getattr(candidate.backend, "require_skill_evidence", False))
@@ -1226,7 +1236,7 @@ class RoutingBackend(SubagentBackend):
                     task_id=task_id,
                     workspace=workspace,
                     chosen_backend=candidate.name,
-                    model=self._model_for(candidate.name, candidate.backend, call_kwargs),
+                    model=str(session_bundle.get("resolved_model") or self._model_for(candidate.name, candidate.backend, call_kwargs)),
                     primary_model=first_model,
                     failover_chain_records=attempt_records,
                     final_status="succeeded",
@@ -1237,7 +1247,7 @@ class RoutingBackend(SubagentBackend):
             except BaseException as exc:
                 last_exc = exc
                 if session_bundle.get("canonical_model") or session_bundle.get("resolved_model"):
-                    model_failure = getattr(exc, "model_unavailable", False) or any(tok in str(exc).lower() for tok in ("429", "rate limit", "quota", "model", "overloaded", "unavailable", "capacity"))
+                    model_failure = getattr(exc, "model_unavailable", False) or any(tok in str(exc).lower() for tok in ("429", "rate limit", "rate_limit", "quota", "overloaded", "model_not_found", "model not found", "model unavailable", "model_unavailable", "unsupported model", "capacity"))
                     if model_failure:
                         failed_models_for_run.extend(str(model) for model in (session_bundle.get("canonical_model"), session_bundle.get("resolved_model")) if model and str(model) not in failed_models_for_run)
                 await self._handle_attempt_exception(
@@ -1279,7 +1289,8 @@ class RoutingBackend(SubagentBackend):
             **telemetry_extra,
         )
         summary = ", ".join(f"{r['backend']}:{r['error_class']}" for r in attempt_records)
-        if last_exc is not None and type(last_exc).__name__ == "SkillContractViolationError":
+        from raven.agent.subagent.oh_my_raven import SkillContractViolationError
+        if last_exc is not None and isinstance(last_exc, SkillContractViolationError):
             raise last_exc
         detail = f": {last_exc}" if last_exc is not None else ""
         raise SubagentFailoverExhaustedError(
