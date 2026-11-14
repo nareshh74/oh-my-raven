@@ -383,6 +383,7 @@ class SpecialistFolderManager:
             elif entry.is_dir(): shutil.rmtree(entry)
             else: entry.unlink()
         startup_skill_set = set(spec.startup_skills) | set(BUCKET1_STARTUP_SKILLS)
+        startup_mcp_set = set(spec.startup_mcp_servers) | set(BUCKET1_STARTUP_MCPS)
         active_skills = {p for p in skill_packs if p not in disabled_skills and (p not in startup_skill_set or p in force_specialist_skills)}
         active_plugins = {p for p in plugins if p not in disabled_plugins}
         for entry in skills_dir.iterdir():
@@ -408,8 +409,8 @@ class SpecialistFolderManager:
             src = next((p / plugin for p in map(Path, extra_plugin_roots) if (p / plugin).is_dir()), None); target = plugins_dir / plugin
             materialize(src, target)
             if not any(target.iterdir()): (target / "plugin.json").write_text(json.dumps({"name": plugin, "enabled": True}, indent=2), encoding="utf-8")
-        servers = {s: spec.mcp_server_configs.get(s, {"type": "stdio", "command": s, "args": [], "enabled": True}) for s in spec.mcp_servers if s not in spec.disabled_mcp_servers and s not in spec.startup_mcp_servers}
-        _write_json(spec_dir / "mcp.json", {"_omr_meta": {"enabled": list(spec.mcp_servers), "disabled": list(spec.disabled_mcp_servers), "strict_mcp_scope": bool(spec.strict_mcp_scope)}, "mcpServers": servers})
+        servers = {s: spec.mcp_server_configs.get(s, {"type": "stdio", "command": s, "args": [], "enabled": True}) for s in spec.mcp_servers if s not in spec.disabled_mcp_servers and s not in startup_mcp_set}
+        _write_json(spec_dir / "mcp.json", {"_omr_meta": {"enabled": [s for s in spec.mcp_servers if s not in startup_mcp_set], "startup_mcps": sorted(set(spec.startup_mcp_servers) | (set(spec.mcp_servers) & set(BUCKET1_STARTUP_MCPS))), "disabled": list(spec.disabled_mcp_servers), "strict_mcp_scope": bool(spec.strict_mcp_scope)}, "mcpServers": servers})
         agents = spec_dir / "AGENTS.md"; agents.write_text(spec.to_agents_md(resolved_skills_dir=skills_dir), encoding="utf-8")
         return dataclass_replace(spec, slug=spec.resolved_slug, specialist_dir=str(spec_dir), agents_md_path=str(agents), skill_dirs=(str(skills_dir), *spec.skill_dirs))
 
@@ -420,11 +421,15 @@ class HarnessStartupContractViolationError(RuntimeError): pass
 class HarnessStartupReceipt:
     harness_name: str; harness_family: str; harness_home: str
     installed_skills: tuple[str, ...] = (); installed_mcps: tuple[str, ...] = (); installed_plugins: tuple[str, ...] = ()
-    missing_skills: tuple[str, ...] = (); missing_mcps: tuple[str, ...] = (); manifest_path: str = ""; ready: bool = True
+    missing_skills: tuple[str, ...] = (); missing_mcps: tuple[str, ...] = (); missing_plugins: tuple[str, ...] = (); manifest_path: str = ""; ready: bool = True
 
 class HarnessStartupManager:
     @classmethod
-    def ensure_and_verify_harness(cls, harness_name: str, harness_root: Path | str, *, backend: Any = None, required_startup_skills: Sequence[str] = BUCKET1_STARTUP_SKILLS, required_startup_mcps: Sequence[str] = BUCKET1_STARTUP_MCPS, extra_skill_roots: Sequence[str | Path] = (), auto_install: bool = True) -> HarnessStartupReceipt:
+    def ensure_and_verify_harness(cls, harness_name: str, harness_root: Path | str, *, backend: Any = None, required_startup_skills: Sequence[str] = BUCKET1_STARTUP_SKILLS, required_startup_mcps: Sequence[str] = BUCKET1_STARTUP_MCPS, required_startup_plugins: Sequence[str] = BUCKET1_STARTUP_PLUGINS, extra_skill_roots: Sequence[str | Path] = (), auto_install: bool = True) -> HarnessStartupReceipt:
+        if not str(harness_name).strip() or "/" in str(harness_name) or "\\" in str(harness_name) or ".." in str(harness_name) or ":" in str(harness_name): raise ValueError(f"Unsafe harness name: {harness_name!r}")
+        for s in required_startup_skills: SpecialistFolderManager._validate_safe_component(s, "startup_skill")
+        for m in required_startup_mcps: SpecialistFolderManager._validate_safe_component(m, "startup_mcp")
+        for p in required_startup_plugins: SpecialistFolderManager._validate_safe_component(p, "startup_plugin")
         root = Path(harness_root).expanduser().resolve(); h_dir = SpecialistFolderManager._ensure_within(root, root / _slugify_specialist(harness_name), "harness_home")
         skills, plugins, hooks = h_dir / "skills", h_dir / "plugins", h_dir / "hooks"
         for d in (skills, plugins, hooks): d.mkdir(parents=True, exist_ok=True)
@@ -438,17 +443,30 @@ class HarnessStartupManager:
                         except OSError: shutil.copytree(src, dst, dirs_exist_ok=True)
                     else: dst.mkdir(parents=True)
                 if not (dst / "SKILL.md").is_file(): (dst / "SKILL.md").write_text(SkillPackResolver.resolve_skill_pack_text(name, extra_dirs=extra_skill_roots), encoding="utf-8")
-            _write_json(h_dir / "mcp.json", {"mcpServers": {m: {"type": "stdio", "command": m, "args": [], "enabled": True} for m in required_startup_mcps}})
+            try: existing_doc = json.loads((h_dir / "mcp.json").read_text(encoding="utf-8")) if (h_dir / "mcp.json").is_file() else {}
+            except (OSError, ValueError): existing_doc = {}
+            servers = dict(existing_doc.get("mcpServers") or {})
+            for m in required_startup_mcps:
+                if m not in servers or not isinstance(servers[m], dict): servers[m] = {"type": "stdio", "command": m, "args": [], "enabled": True}
+                else: servers[m].setdefault("type", "stdio"); servers[m].setdefault("command", m); servers[m]["enabled"] = True
+            _write_json(h_dir / "mcp.json", {"_omr_meta": {"bucket": 1, "required_mcps": list(required_startup_mcps)}, **existing_doc, "mcpServers": servers})
             _write_json(hooks / "startup_hooks.json", {"hooks": ["everos", "wiki_session_route", "token-optimizer", "codeburn-startup", "repo-context-hook"]})
-            for name in BUCKET1_STARTUP_PLUGINS: (plugins / name).mkdir(exist_ok=True)
+            for p in required_startup_plugins:
+                pdir = plugins / p; pdir.mkdir(exist_ok=True)
+                if not ((pdir / "plugin.json").is_file() or (pdir / "__init__.py").is_file()): (pdir / "plugin.json").write_text(json.dumps({"name": p, "bucket": 1, "enabled": True}, indent=2), encoding="utf-8")
         installed_skills = tuple(s for s in required_startup_skills if (skills / s / "SKILL.md").is_file()); missing_skills = tuple(s for s in required_startup_skills if s not in installed_skills)
         try: servers = json.loads((h_dir / "mcp.json").read_text(encoding="utf-8")).get("mcpServers", {})
         except (OSError, ValueError): servers = {}
-        installed_mcps = tuple(m for m in required_startup_mcps if m in servers); missing_mcps = tuple(m for m in required_startup_mcps if m not in installed_mcps)
-        installed_plugins = tuple(p for p in BUCKET1_STARTUP_PLUGINS if (plugins / p).is_dir()); manifest = h_dir / "startup_manifest.json"
-        data = dict(harness_name=harness_name, harness_family=SessionHarnessFlagBuilder.detect_harness_family(harness_name, backend), harness_home=str(h_dir), installed_skills=installed_skills, installed_mcps=installed_mcps, installed_plugins=installed_plugins, missing_skills=missing_skills, missing_mcps=missing_mcps, ready=not (missing_skills or missing_mcps)); _write_json(manifest, data)
+        installed_mcps = tuple(m for m in required_startup_mcps if m in servers and isinstance(servers[m], dict) and servers[m].get("enabled", True) is not False and bool(str(servers[m].get("command", "") or servers[m].get("url", "")).strip())); missing_mcps = tuple(m for m in required_startup_mcps if m not in installed_mcps)
+        def plugin_installed(p: str) -> bool:
+            pdir = plugins / p
+            try: enabled_manifest = (pdir / "plugin.json").is_file() and json.loads((pdir / "plugin.json").read_text(encoding="utf-8")).get("enabled", True) is not False
+            except (OSError, ValueError): enabled_manifest = False
+            return pdir.is_dir() and (enabled_manifest or (pdir / "__init__.py").is_file())
+        installed_plugins = tuple(p for p in required_startup_plugins if plugin_installed(p)); missing_plugins = tuple(p for p in required_startup_plugins if p not in installed_plugins); manifest = h_dir / "startup_manifest.json"
+        data = dict(harness_name=harness_name, harness_family=SessionHarnessFlagBuilder.detect_harness_family(harness_name, backend), harness_home=str(h_dir), installed_skills=installed_skills, installed_mcps=installed_mcps, installed_plugins=installed_plugins, missing_skills=missing_skills, missing_mcps=missing_mcps, missing_plugins=missing_plugins, ready=not (missing_skills or missing_mcps or missing_plugins)); _write_json(manifest, data)
         receipt = HarnessStartupReceipt(**data, manifest_path=str(manifest))
-        if missing_skills or missing_mcps: raise HarnessStartupContractViolationError(f"Harness {harness_name!r} failed startup onboarding probe: missing_skills={missing_skills}, missing_mcps={missing_mcps}")
+        if missing_skills or missing_mcps or missing_plugins: raise HarnessStartupContractViolationError(f"Harness {harness_name!r} failed startup onboarding probe: missing_skills={missing_skills}, missing_mcps={missing_mcps}, missing_plugins={missing_plugins}")
         for attr, value in (("startup_receipt", receipt), ("harness_home", str(h_dir))):
             try: setattr(backend, attr, value)
             except (AttributeError, TypeError): pass
@@ -459,10 +477,10 @@ class HarnessStartupManager:
         raw_items = harnesses.items() if isinstance(harnesses, Mapping) else harnesses
         items = [(x, None) if isinstance(x, str) else tuple(x) for x in raw_items]
         receipts = {n: cls.ensure_and_verify_harness(n, harness_root, backend=b, **kwargs) for n, b in items}
-        skill_sets = [set(r.installed_skills) for r in receipts.values()]; mcp_sets = [set(r.installed_mcps) for r in receipts.values()]
-        su = set().union(*skill_sets) if skill_sets else set(); mu = set().union(*mcp_sets) if mcp_sets else set()
-        drift = {n: {"missing_skills": sorted(su - set(r.installed_skills)), "missing_mcps": sorted(mu - set(r.installed_mcps))} for n, r in receipts.items()}
-        return {"receipts": receipts, "skills_intersection": tuple(sorted(set.intersection(*skill_sets))) if skill_sets else (), "mcps_intersection": tuple(sorted(set.intersection(*mcp_sets))) if mcp_sets else (), "drift": drift, "in_sync": all(not v["missing_skills"] and not v["missing_mcps"] for v in drift.values())}
+        skill_sets = [set(r.installed_skills) for r in receipts.values()]; mcp_sets = [set(r.installed_mcps) for r in receipts.values()]; plugin_sets = [set(r.installed_plugins) for r in receipts.values()]
+        su = set().union(*skill_sets) if skill_sets else set(); mu = set().union(*mcp_sets) if mcp_sets else set(); plugin_union = set().union(*plugin_sets) if plugin_sets else set()
+        drift = {n: {"missing_skills": sorted(su - set(r.installed_skills)), "missing_mcps": sorted(mu - set(r.installed_mcps)), "missing_plugins": sorted(plugin_union - set(r.installed_plugins))} for n, r in receipts.items()}
+        return {"receipts": receipts, "skills_intersection": tuple(sorted(set.intersection(*skill_sets))) if skill_sets else (), "mcps_intersection": tuple(sorted(set.intersection(*mcp_sets))) if mcp_sets else (), "plugins_intersection": tuple(sorted(set.intersection(*plugin_sets))) if plugin_sets else (), "drift": drift, "in_sync": all(not v["missing_skills"] and not v["missing_mcps"] and not v["missing_plugins"] for v in drift.values())}
 
 class SessionHarnessFlagBuilder:
     @classmethod
@@ -685,13 +703,15 @@ class SkillAndToolReceiptGate:
 
         raw_expected_packs = tuple(required_skill_packs) or (spec_def.skill_packs if spec_def is not None else ())
         raw_expected_mcps = tuple(required_mcps) or (spec_def.mcp_servers if spec_def is not None else ())
-        startup_skills = set(spec_def.startup_skills) if spec_def is not None else set(); startup_mcps = set(spec_def.startup_mcp_servers) if spec_def is not None else set()
+        startup_skills = (set(spec_def.startup_skills) | (set(raw_expected_packs) & set(BUCKET1_STARTUP_SKILLS))) if spec_def is not None else set()
+        startup_mcps = (set(spec_def.startup_mcp_servers) | (set(raw_expected_mcps) & set(BUCKET1_STARTUP_MCPS))) if spec_def is not None else set()
         expected_packs = tuple(p for p in raw_expected_packs if p not in startup_skills); expected_mcps = tuple(m for m in raw_expected_mcps if m not in startup_mcps)
         if spec_def is not None and (startup_skills or startup_mcps):
-            candidate = agent_backend or getattr(node, "last_chosen_backend_obj", None); receipt = getattr(candidate, "startup_receipt", None)
-            if receipt is not None:
-                missing_s = tuple(s for s in spec_def.startup_skills if s not in receipt.installed_skills); missing_m = tuple(m for m in spec_def.startup_mcp_servers if m not in receipt.installed_mcps)
-                if missing_s or missing_m: raise SkillContractViolationError(f"Harness {getattr(receipt, 'harness_name', '')!r} missing specialist startup assumption missing_skills={missing_s}, missing_mcps={missing_m}")
+            candidate = agent_backend or getattr(node, "last_chosen_backend_obj", None)
+            receipt = getattr(candidate, "startup_receipt", None) or getattr(node, "startup_receipt", None)
+            if receipt is None: raise SkillContractViolationError(f"Specialist on node '{getattr(node, 'id', '')}' failed closed: missing HarnessStartupReceipt for Bucket-1 startup artifacts skills={sorted(startup_skills)}, mcps={sorted(startup_mcps)}")
+            missing_s = tuple(s for s in sorted(startup_skills) if s not in receipt.installed_skills); missing_m = tuple(m for m in sorted(startup_mcps) if m not in receipt.installed_mcps)
+            if not receipt.ready or missing_s or missing_m: raise SkillContractViolationError(f"Harness {getattr(receipt, 'harness_name', '')!r} missing specialist startup assumption missing_skills={missing_s}, missing_mcps={missing_m}")
         expected_tools = tuple(required_tools) or tuple(getattr(agent_backend, "required_tools", ()) or ())
 
         if delivered_prompt and spec_def is not None and spec_def.has_specialist_bundle:
@@ -2601,11 +2621,11 @@ class OmrDispatcher:
         backend: Any,
         weight: float = 1.0,
         max_failovers: int | None = None,
-        *, auto_install_startup: bool = True, required_startup_skills: Sequence[str] = BUCKET1_STARTUP_SKILLS, required_startup_mcps: Sequence[str] = BUCKET1_STARTUP_MCPS, extra_skill_roots: Sequence[str | Path] = (),
+        *, auto_install_startup: bool = True, required_startup_skills: Sequence[str] = BUCKET1_STARTUP_SKILLS, required_startup_mcps: Sequence[str] = BUCKET1_STARTUP_MCPS, required_startup_plugins: Sequence[str] = BUCKET1_STARTUP_PLUGINS, extra_skill_roots: Sequence[str | Path] = (),
     ) -> int:
         """Add a runtime harness to every routed specialist without profile setup."""
         del weight
-        receipt = HarnessStartupManager.ensure_and_verify_harness(name, getattr(self, "harnesses_root", self.run_root.parent / "harnesses"), backend=backend, required_startup_skills=required_startup_skills, required_startup_mcps=required_startup_mcps, extra_skill_roots=extra_skill_roots, auto_install=auto_install_startup)
+        receipt = HarnessStartupManager.ensure_and_verify_harness(name, getattr(self, "harnesses_root", self.run_root.parent / "harnesses"), backend=backend, required_startup_skills=required_startup_skills, required_startup_mcps=required_startup_mcps, required_startup_plugins=required_startup_plugins, extra_skill_roots=extra_skill_roots, auto_install=auto_install_startup)
         self.harness_receipts = getattr(self, "harness_receipts", {}); self.harness_receipts[name] = receipt
         backends = getattr(self.table, "_backends", None) or getattr(self.table, "_b", {})
         updated = 0
@@ -2650,6 +2670,10 @@ class OmrDispatcher:
                 route_targets.append(target)
         if not route_targets:
             raise ValueError("A dynamic specialist requires at least one harness target")
+        for target in route_targets:
+            if getattr(target.backend, "startup_receipt", None) is None:
+                receipt = HarnessStartupManager.ensure_and_verify_harness(target.name, getattr(self, "harnesses_root", self.run_root.parent / "harnesses"), backend=target.backend, auto_install=True)
+                self.harness_receipts = getattr(self, "harness_receipts", {}); self.harness_receipts[target.name] = receipt
         spec_def = SpecialistDefinition.from_obj(specialist_definition) if specialist_definition is not None else SpecialistDefinition(name=name)
         if not spec_def.name:
             spec_def = dataclass_replace(spec_def, name=name)
