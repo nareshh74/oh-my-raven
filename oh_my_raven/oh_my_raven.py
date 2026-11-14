@@ -707,8 +707,8 @@ class SkillAndToolReceiptGate:
         startup_mcps = (set(spec_def.startup_mcp_servers) | (set(raw_expected_mcps) & set(BUCKET1_STARTUP_MCPS))) if spec_def is not None else set()
         expected_packs = tuple(p for p in raw_expected_packs if p not in startup_skills); expected_mcps = tuple(m for m in raw_expected_mcps if m not in startup_mcps)
         if spec_def is not None and (startup_skills or startup_mcps):
-            candidate = agent_backend or getattr(node, "last_chosen_backend_obj", None)
-            receipt = getattr(candidate, "startup_receipt", None) or getattr(node, "startup_receipt", None)
+            chosen_obj = getattr(agent_backend, "last_chosen_backend_obj", None) or getattr(node, "last_chosen_backend_obj", None)
+            receipt = getattr(agent_backend, "startup_receipt", None) or getattr(chosen_obj, "startup_receipt", None) or getattr(node, "startup_receipt", None)
             if receipt is None: raise SkillContractViolationError(f"Specialist on node '{getattr(node, 'id', '')}' failed closed: missing HarnessStartupReceipt for Bucket-1 startup artifacts skills={sorted(startup_skills)}, mcps={sorted(startup_mcps)}")
             missing_s = tuple(s for s in sorted(startup_skills) if s not in receipt.installed_skills); missing_m = tuple(m for m in sorted(startup_mcps) if m not in receipt.installed_mcps)
             if not receipt.ready or missing_s or missing_m: raise SkillContractViolationError(f"Harness {getattr(receipt, 'harness_name', '')!r} missing specialist startup assumption missing_skills={missing_s}, missing_mcps={missing_m}")
