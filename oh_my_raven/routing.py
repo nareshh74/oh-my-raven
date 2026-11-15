@@ -411,7 +411,7 @@ class RoutingBackend(SubagentBackend):
         self._salvage_on_dirty_crash = bool(salvage_on_dirty_crash)
         self._worktree_salvager = worktree_salvager
         self._attempt_timeout_s = float(attempt_timeout_s) if attempt_timeout_s is not None else None
-        self.last_salvage_receipts: list[dict[str, Any]] = []
+        self.last_salvage_receipts: list[Any] = []
         self._pending_forensic_brief = ""
         self._cooldown_until: dict[str, float] = {}
         self._instance_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -865,6 +865,7 @@ class RoutingBackend(SubagentBackend):
         reasoning_effort: str = "",
         model_resolution_source: str = "",
         model_fallback_used: bool = False,
+        salvage_receipts: Sequence[Any] = (),
     ) -> None:
         tpath = self._resolve_telemetry_path(session_key)
         if tpath is None:
@@ -901,6 +902,9 @@ class RoutingBackend(SubagentBackend):
             "model_resolution_source": model_resolution_source,
             "model_fallback_used": bool(model_fallback_used),
         }
+        if salvage_receipts:
+            from dataclasses import asdict
+            record["salvage_receipts"] = [r.to_dict() if hasattr(r, "to_dict") else (dict(r) if isinstance(r, dict) else asdict(r)) for r in salvage_receipts]
         if resolved_model and not model:
             record["model"] = resolved_model
         TelemetryLogger(tpath).write_record(record)
@@ -986,7 +990,7 @@ class RoutingBackend(SubagentBackend):
         run_start: float,
         telemetry_extra: dict[str, Any],
         exc: BaseException,
-    ) -> None:
+    ) -> dict[str, Any]:
         has_cleanup_hook = callable(getattr(candidate.backend, "cleanup_attempt", None)) or callable(
             getattr(candidate.backend, "cancel", None)
         )
@@ -1026,10 +1030,9 @@ class RoutingBackend(SubagentBackend):
             if getattr(salvage, "restored_clean", False) or getattr(salvage, "action", "") == "carried_forward":
                 from dataclasses import asdict
                 data = asdict(salvage) if hasattr(salvage, "__dataclass_fields__") else dict(salvage)
-                self.last_salvage_receipts.append(data)
+                self.last_salvage_receipts.append(salvage)
                 self._pending_forensic_brief = salvage.format_forensic_brief() if hasattr(salvage, "format_forensic_brief") else str(data)
-                attempt_records.append({"backend": candidate.name, "status": "failed", "error_class": error_class, "duration_ms": duration_ms, "salvaged_dirty_worktree": True, "dirty_paths": dirty_paths, "salvage_action": data.get("action", ""), "forensic_patch": data.get("patch_path", ""), "forensic_summary": data.get("diff_summary", "")})
-                return
+                return {"salvaged_dirty_worktree": True, "dirty_paths": dirty_paths, "salvage_action": data.get("action", ""), "forensic_patch": data.get("patch_path", ""), "forensic_summary": data.get("diff_summary", "")}
         if dirty_paths or not idempotent:
             receipt = {
                 "backend": candidate.name,
@@ -1055,6 +1058,7 @@ class RoutingBackend(SubagentBackend):
                 f"{self.name!r}: failover blocked after {candidate.name!r} failed with {error_class} and left dirty paths {dirty_paths!r}",
                 attempt_receipts=attempt_records,
             ) from exc
+        return {}
 
     async def _handle_attempt_exception(
         self,
@@ -1098,8 +1102,9 @@ class RoutingBackend(SubagentBackend):
             )
             raise exc
         cleaned = await self._cleanup_failed_attempt(candidate.backend, task_id, workspace)
+        salvage_fields: dict[str, Any] = {}
         if writes:
-            self._verify_write_failover_safety(
+            salvage_fields = self._verify_write_failover_safety(
                 candidate=candidate,
                 cleaned=cleaned,
                 idempotent=idempotent,
@@ -1116,7 +1121,7 @@ class RoutingBackend(SubagentBackend):
                 exc=exc,
             )
         attempt_records.append(
-            {"backend": candidate.name, "status": "failed", "error_class": error_class, "duration_ms": duration_ms, **session_fields}
+            {"backend": candidate.name, "status": "failed", "error_class": error_class, "duration_ms": duration_ms, **salvage_fields, **session_fields}
         )
         self._record_cooldown(candidate.name)
         await self._unbind_failed_instance(session_key, candidate.name, instance)

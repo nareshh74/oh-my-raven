@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from contextlib import closing
 from dataclasses import asdict, dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1385,6 +1386,11 @@ class WorktreeSalvageReceipt:
     tests_passed: bool = False
     restored_clean: bool = True
 
+    def __getitem__(self, key: str) -> Any: return getattr(self, key)
+    def get(self, key: str, default: Any = None) -> Any: return getattr(self, key, default)
+    def keys(self) -> tuple[str, ...]: return ("task_id", "worktree_path", "base_sha", "dirty_paths", "patch_path", "diff_summary", "action", "tests_passed", "restored_clean")
+    def to_dict(self) -> dict[str, Any]: return {k: getattr(self, k) for k in self.keys()}
+
     def format_forensic_brief(self) -> str:
         return f"[BEGIN FORENSIC CRASH SALVAGE]\nPrevious worker crashed/timed out after modifying: {', '.join(self.dirty_paths)}.\nAction taken: {self.action} (worktree reset to {self.base_sha[:12] if self.base_sha else 'HEAD'}).\nForensic patch: {self.patch_path}\nDiff summary:\n{self.diff_summary}\n[END FORENSIC CRASH SALVAGE]"
 
@@ -1537,28 +1543,31 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
 class SqliteRecoveryCheckpointer:
     def __init__(self, db_path: Path | str) -> None:
         self.db_path = Path(db_path); self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_path) as db:
-            db.execute("CREATE TABLE IF NOT EXISTS node_checkpoints (run_id TEXT, node_id TEXT, status TEXT, head_sha TEXT, output TEXT, salvage_json TEXT, attempt_count INTEGER, updated_at TEXT, PRIMARY KEY (run_id, node_id))")
-            db.execute("CREATE TABLE IF NOT EXISTS task_leases (task_id TEXT PRIMARY KEY, specialist TEXT, harness TEXT, status TEXT, lease_json TEXT, updated_at TEXT)")
+        with closing(sqlite3.connect(self.db_path)) as db:
+            with db:
+                db.execute("CREATE TABLE IF NOT EXISTS node_checkpoints (run_id TEXT, node_id TEXT, status TEXT, head_sha TEXT, output TEXT, salvage_json TEXT, attempt_count INTEGER, updated_at TEXT, PRIMARY KEY (run_id, node_id))")
+                db.execute("CREATE TABLE IF NOT EXISTS task_leases (task_id TEXT PRIMARY KEY, specialist TEXT, harness TEXT, status TEXT, lease_json TEXT, updated_at TEXT)")
 
     def save_checkpoint(self, run_id: str, node_id: str, *, status: str, head_sha: str = "", output: str = "", salvage: dict[str, Any] | None = None, attempt_count: int = 1) -> dict[str, Any]:
         updated_at = datetime.now(timezone.utc).isoformat(); salvage = salvage or {}
-        with sqlite3.connect(self.db_path) as db:
-            db.execute("INSERT OR REPLACE INTO node_checkpoints VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (run_id, node_id, status, head_sha, output, json.dumps(salvage), attempt_count, updated_at))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            with db:
+                db.execute("INSERT OR REPLACE INTO node_checkpoints VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (run_id, node_id, status, head_sha, output, json.dumps(salvage), attempt_count, updated_at))
         return {"run_id": run_id, "node_id": node_id, "status": status, "head_sha": head_sha, "output": output, "salvage": salvage, "attempt_count": attempt_count, "updated_at": updated_at}
 
     def get_checkpoint(self, run_id: str, node_id: str) -> dict[str, Any] | None:
-        with sqlite3.connect(self.db_path) as db: row = db.execute("SELECT * FROM node_checkpoints WHERE run_id=? AND node_id=?", (run_id, node_id)).fetchone()
+        with closing(sqlite3.connect(self.db_path)) as db: row = db.execute("SELECT * FROM node_checkpoints WHERE run_id=? AND node_id=?", (run_id, node_id)).fetchone()
         if row is None: return None
         return dict(zip(("run_id", "node_id", "status", "head_sha", "output", "salvage_json", "attempt_count", "updated_at"), row)) | {"salvage": json.loads(row[5] or "{}")}
 
     def list_completed_nodes(self, run_id: str) -> dict[str, dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as db: ids = [r[0] for r in db.execute("SELECT node_id FROM node_checkpoints WHERE run_id=? AND status='completed'", (run_id,))]
+        with closing(sqlite3.connect(self.db_path)) as db: ids = [r[0] for r in db.execute("SELECT node_id FROM node_checkpoints WHERE run_id=? AND status='completed'", (run_id,))]
         return {node_id: self.get_checkpoint(run_id, node_id) for node_id in ids}  # type: ignore[misc]
 
     def record_lease(self, lease: WorkerLease) -> None:
-        with sqlite3.connect(self.db_path) as db:
-            db.execute("INSERT OR REPLACE INTO task_leases VALUES (?, ?, ?, ?, ?, ?)", (lease.task_id, lease.specialist, lease.harness, lease.status, json.dumps(asdict(lease)), datetime.now(timezone.utc).isoformat()))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            with db:
+                db.execute("INSERT OR REPLACE INTO task_leases VALUES (?, ?, ?, ?, ?, ?)", (lease.task_id, lease.specialist, lease.harness, lease.status, json.dumps(asdict(lease)), datetime.now(timezone.utc).isoformat()))
 
 
 class DurableRecoveryLedger:
