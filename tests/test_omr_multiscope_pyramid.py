@@ -725,3 +725,104 @@ class TestR24ModelConfig:
         rb, _ = self._rb(c_dir, h1, h2, self._cfg())
         with pytest.raises(SkillContractViolationError):
             asyncio.run(rb.run("t", task_id="1", workspace=Path("."), executor=None))
+
+
+class TestR25DurableWorkerRecovery:
+    def test_r25_watchdog_dual_liveness_and_queue_atomic_claim(self, tmp_path):
+        from oh_my_raven.oh_my_raven import WorkerLivenessWatchdog
+
+        now = [0.0]
+        wd = WorkerLivenessWatchdog(clock=lambda: now[0])
+        wd.acquire_lease("a", "S", "H", lease_ttl_s=100, stall_ttl_s=10)
+        assert wd.check_liveness("a") == (True, "alive")
+        now[0] = 11
+        ok, why = wd.check_liveness("a")
+        assert not ok and why.startswith("stdout_stall_exceeded")
+        wd.heartbeat("a")
+        assert wd.check_liveness("a") == (True, "alive")
+        wd.acquire_lease("b", "S", "H", lease_ttl_s=5, stall_ttl_s=1000)
+        now[0] = 20
+        ok, why = wd.check_liveness("b")
+        assert not ok and why.startswith("lease_ttl_exceeded")
+
+        hits: list[Any] = []
+
+        async def hung():
+            await asyncio.sleep(30)
+
+        async def run():
+            real = WorkerLivenessWatchdog()
+            with pytest.raises(BaseException):
+                await real.run_with_lease("c", "S", "H", hung(), lease_ttl_s=0.2, stall_ttl_s=0.2,
+                                          on_timeout=lambda *a: hits.append(a))
+        asyncio.run(run())
+        assert hits
+
+        q = OmrTaskQueue(tmp_path / "q.jsonl")
+        q.enqueue("T1", "p", assigned_specialist="S", wave=0, status="enqueued")
+        got = q.claim_ready()
+        assert got is not None and got.task_id == "T1"
+        assert q.latest_by_task()["T1"].status == "running"
+        assert q.claim_ready() is None
+
+    def test_r25_dirty_worktree_salvage_sqlite_checkpoint_and_context_failover(self, tmp_path):
+        from oh_my_raven.oh_my_raven import DurableRecoveryLedger
+
+        repo = _init_repo(tmp_path)
+        base = _git(repo, "rev-parse", "HEAD")
+        wt = WorktreeManager().provision_worktree(repo, tmp_path / "wts", "run", "n1", base)
+        _git(wt, "config", "user.email", "t@example.com")
+        _git(wt, "config", "user.name", "t")
+        seen: dict[str, Any] = {}
+
+        class W1:
+            name, kind, streams = "Claude-Code", "cli", False
+
+            async def run(self, task, **kw):
+                (wt / "partial_feature.py").write_text("def half(:\n", encoding="utf-8")
+                raise TimeoutError("worker hung mid-edit")
+
+        class W2:
+            name, kind, streams = "Codex-CLI", "cli", False
+
+            async def run(self, task, **kw):
+                seen["task"] = task
+                seen["clean"] = _git(wt, "status", "--porcelain", "-uall") == ""
+                (wt / "clean_feature.py").write_text("X = 1\n", encoding="utf-8")
+                _git(wt, "add", "-A")
+                _git(wt, "commit", "-q", "-m", "clean")
+                return json.dumps({"evidence": {"artifact_path": "clean_feature.py"}})
+
+        rb = _routing("Worker", W1(), [W2()], salvage_on_dirty_crash=True)
+        table = _Table({"Manager": _routing("Manager", _Manager()), "Worker": rb})
+        d = _dispatcher(tmp_path, repo, table)
+        d.workdir = wt
+        asyncio.run(d.dispatch_specialist_node("T-R25", "Worker", "build feature", workspace=wt,
+                                               writes=True, salvage_on_dirty_crash=True))
+        assert "[BEGIN FORENSIC CRASH SALVAGE]" in seen["task"] and "partial_feature.py" in seen["task"]
+        assert seen["clean"]
+        assert len(rb.last_salvage_receipts) == 1
+        r = rb.last_salvage_receipts[0]
+        assert r.action == "clean_reset" and Path(r.patch_path).is_file()
+        assert str(r.patch_path).endswith(".forensic.patch")
+        cp = d.checkpointer.get_checkpoint("dispatch", "T-R25")
+        assert cp and cp["status"] == "completed"
+
+        kw = dict(run_id="r", node_id="n", input_hash="h", backend="Claude-Code",
+                  failure_class="TimeoutError", dirty_paths=["partial_feature.py"])
+        led = DurableRecoveryLedger(tmp_path / "recovery.json")
+        assert led.record_attempt(**kw, salvaged=True)["next_action"] == "retry"
+        led2 = DurableRecoveryLedger(tmp_path / "recovery2.json")
+        assert led2.record_attempt(**kw, salvaged=False)["next_action"] == "quarantine"
+
+    def test_r25_carry_forward_when_tests_pass_policy(self, tmp_path):
+        repo = _init_repo(tmp_path)
+        base = _git(repo, "rev-parse", "HEAD")
+        wt = WorktreeManager().provision_worktree(repo, tmp_path / "wts", "run", "cf", base)
+        (wt / "wip.py").write_text("X = 1\n", encoding="utf-8")
+        rec = WorktreeManager().salvage_dirty_worktree(
+            wt, base, task_id="cf", forensic_dir=tmp_path / "forensic",
+            salvage_policy="carry_forward_if_tests_pass",
+            test_command=[sys.executable, "-c", "import sys; sys.exit(0)"])
+        assert rec.action == "carried_forward" and rec.tests_passed is True
+        assert (wt / "wip.py").exists()
