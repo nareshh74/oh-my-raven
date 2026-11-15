@@ -14,8 +14,8 @@ Span capture: owned recording tracer bound to oh_my_raven.gate/routing.
 | W5_crash_revival_failover_hot_onboard | True | 3128.67 | attempts=['failed', 'succeeded'], claude_calls=1, chosen_backend=Windsurf-ACP, committed=True, status=completed, onboard_logged=True |
 | W6_irreversible_action_blocked | True | 0.05 | blocked=True, callback_ran=False |
 | W7_per_specialist_folder_agents_md_and_session_flag_failover | True | 3323.7 | bucket1_reconciled=True, gstack_in_bucket2=True, specialist_dir_created=True, agents_md_loaded=True, claude_flags_ok=True, codex_flags_ok=True, model_config_ok=True, first_attempt_error=SkillContractViolationError, chosen_backend=Codex-CLI, worktree_clean=True |
-
 | W8_durable_worker_crash_salvage_and_sqlite_resume | pending | - | not yet run; regenerate with `--write-report` once the R25 `oh_my_raven` lane lands |
+
 All 7 workloads OK: **True**
 
 ## Monitoring receipts
