@@ -7,14 +7,14 @@ Span capture: owned recording tracer bound to oh_my_raven.gate/routing.
 
 | Workload | OK | Latency (ms) | Detail |
 |---|---|---|---|
-| W1_trivial_fast_path | True | 73.53 | tier=trivial, status=completed, specialist_turns=1 |
-| W2_council_plan_review | True | 20.91 | first_consensus=False, second_consensus=True, gaps=['missing edge-case test for empty input'] |
-| W3_ambiguity_experiment | True | 142.77 | proceed=True, resolved_by=experiment |
-| W4_premature_completion_lesson_loop | True | 4349.16 | first_status=incomplete, retry_status=completed, lessons_injected=True |
-| W5_crash_revival_failover_hot_onboard | True | 2243.75 | attempts=['failed', 'succeeded'], claude_calls=1, chosen_backend=Windsurf-ACP, committed=True, status=completed, onboard_logged=True |
+| W1_trivial_fast_path | True | 92.82 | tier=trivial, status=completed, specialist_turns=1 |
+| W2_council_plan_review | True | 24.8 | first_consensus=False, second_consensus=True, gaps=['missing edge-case test for empty input'] |
+| W3_ambiguity_experiment | True | 156.08 | proceed=True, resolved_by=experiment |
+| W4_premature_completion_lesson_loop | True | 4767.55 | first_status=incomplete, retry_status=completed, lessons_injected=True |
+| W5_crash_revival_failover_hot_onboard | True | 2415.17 | attempts=['failed', 'succeeded'], claude_calls=1, chosen_backend=Windsurf-ACP, committed=True, status=completed, onboard_logged=True |
 | W6_irreversible_action_blocked | True | 0.04 | blocked=True, callback_ran=False |
-| W7_per_specialist_folder_agents_md_and_session_flag_failover | True | 2496.6 | bucket1_reconciled=True, gstack_in_bucket2=True, specialist_dir_created=True, agents_md_loaded=True, claude_flags_ok=True, codex_flags_ok=True, model_config_ok=True, first_attempt_error=SkillContractViolationError, chosen_backend=Codex-CLI, worktree_clean=True |
-| W8_durable_worker_crash_salvage_and_sqlite_resume | True | 2819.99 | salvaged=True, forensic_patch_exists=True, brief_injected=True, sqlite_checkpoint_ok=True, worktree_clean=True, queue_claim_ok=True, chosen_backend=Codex-CLI |
+| W7_per_specialist_folder_agents_md_and_session_flag_failover | True | 2371.33 | bucket1_reconciled=True, gstack_in_bucket2=True, specialist_dir_created=True, agents_md_loaded=True, claude_flags_ok=True, codex_flags_ok=True, model_config_ok=True, first_attempt_error=SkillContractViolationError, chosen_backend=Codex-CLI, worktree_clean=True |
+| W8_durable_worker_crash_salvage_and_sqlite_resume | True | 3020.03 | salvaged=True, forensic_patch_exists=True, brief_injected=True, sqlite_checkpoint_ok=True, worktree_clean=True, queue_claim_ok=True, chosen_backend=Codex-CLI |
 
 All 8 workloads OK: **True**
 

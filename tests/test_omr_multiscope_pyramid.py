@@ -8,6 +8,7 @@ pipeline under test is monkeypatched.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import json
 import subprocess
 import sys
@@ -758,6 +759,16 @@ class TestR25DurableWorkerRecovery:
         asyncio.run(run())
         assert hits
 
+        async def heartbeat_extends_stall():
+            real = WorkerLivenessWatchdog()
+            async def work():
+                await asyncio.sleep(0.03)
+                real.heartbeat("hb")
+                await asyncio.sleep(0.03)
+                return "ok"
+            assert await real.run_with_lease("hb", "S", "H", work(), lease_ttl_s=1, stall_ttl_s=0.05) == "ok"
+        asyncio.run(heartbeat_extends_stall())
+
         q = OmrTaskQueue(tmp_path / "q.jsonl")
         q.enqueue("T1", "p", assigned_specialist="S", wave=0, status="enqueued")
         got = q.claim_ready()
@@ -798,7 +809,7 @@ class TestR25DurableWorkerRecovery:
         d = _dispatcher(tmp_path, repo, table)
         d.workdir = wt
         asyncio.run(d.dispatch_specialist_node("T-R25", "Worker", "build feature", workspace=wt,
-                                               writes=True, salvage_on_dirty_crash=True))
+                                               writes=True, salvage_on_dirty_crash=True, lease_ttl_s=10))
         assert "[BEGIN FORENSIC CRASH SALVAGE]" in seen["task"] and "partial_feature.py" in seen["task"]
         assert seen["clean"]
         assert len(rb.last_salvage_receipts) == 1
@@ -807,6 +818,8 @@ class TestR25DurableWorkerRecovery:
         assert str(r.patch_path).endswith(".forensic.patch")
         cp = d.checkpointer.get_checkpoint("dispatch", "T-R25")
         assert cp and cp["status"] == "completed"
+        with sqlite3.connect(d.checkpointer.db_path) as db:
+            assert db.execute("SELECT status FROM task_leases WHERE task_id = ?", ("T-R25",)).fetchone()[0] == "released"
 
         kw = dict(run_id="r", node_id="n", input_hash="h", backend="Claude-Code",
                   failure_class="TimeoutError", dirty_paths=["partial_feature.py"])
@@ -826,3 +839,10 @@ class TestR25DurableWorkerRecovery:
             test_command=[sys.executable, "-c", "import sys; sys.exit(0)"])
         assert rec.action == "carried_forward" and rec.tests_passed is True
         assert (wt / "wip.py").exists()
+
+        rec = WorktreeManager().salvage_dirty_worktree(
+            wt, base, task_id="cf-missing", forensic_dir=tmp_path / "forensic",
+            salvage_policy="carry_forward_if_tests_pass",
+            test_command=["nonexistent_binary_xyz"])
+        assert rec.action == "clean_reset" and rec.restored_clean is True
+        assert _git(wt, "status", "--porcelain", "-uall") == ""

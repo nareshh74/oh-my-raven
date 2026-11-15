@@ -14,7 +14,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
-from contextlib import closing
+from contextlib import closing, suppress
 from dataclasses import asdict, dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1322,56 +1322,65 @@ class WorkerLease:
 
 
 class WorkerLivenessWatchdog:
-    def __init__(self, *, default_lease_ttl_s: float = 180.0, default_stall_ttl_s: float = 60.0, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, *, default_lease_ttl_s: float = 180.0, default_stall_ttl_s: float = 60.0, clock: Callable[[], float] = time.monotonic, checkpointer: SqliteRecoveryCheckpointer | None = None) -> None:
         self.default_lease_ttl_s, self.default_stall_ttl_s, self._clock = default_lease_ttl_s, default_stall_ttl_s, clock
+        self.checkpointer = checkpointer
         self._leases: dict[str, WorkerLease] = {}
+
+    def _record(self, lease: WorkerLease) -> WorkerLease:
+        if self.checkpointer is not None: self.checkpointer.record_lease(lease)
+        return lease
 
     def acquire_lease(self, task_id: str, specialist: str, harness: str, *, workspace: Path | str = "", lease_ttl_s: float | None = None, stall_ttl_s: float | None = None, pid: int | None = None) -> WorkerLease:
         now = self._clock()
         lease = WorkerLease(task_id, specialist, harness, str(workspace), self.default_lease_ttl_s if lease_ttl_s is None else lease_ttl_s, self.default_stall_ttl_s if stall_ttl_s is None else stall_ttl_s, now, now, pid)
         self._leases[task_id] = lease
-        return lease
+        return self._record(lease)
 
     def heartbeat(self, task_id: str, *, pid: int | None = None) -> WorkerLease | None:
         lease = self._leases.get(task_id)
         if lease is None: return None
         lease = dataclass_replace(lease, last_heartbeat_at=self._clock(), pid=lease.pid if pid is None else pid)
         self._leases[task_id] = lease
-        return lease
+        return self._record(lease)
 
     def release_lease(self, task_id: str) -> WorkerLease | None:
         lease = self._leases.get(task_id)
         if lease is None: return None
         lease = dataclass_replace(lease, status="released"); self._leases[task_id] = lease
-        return lease
+        return self._record(lease)
 
     def check_liveness(self, task_id: str) -> tuple[bool, str]:
         lease = self._leases.get(task_id)
         if lease is None or lease.status != "active": return True, "alive"
         now = self._clock()
         if now - lease.acquired_at > lease.lease_ttl_s:
-            self._leases[task_id] = dataclass_replace(lease, status="expired_ttl")
+            self._leases[task_id] = self._record(dataclass_replace(lease, status="expired_ttl"))
             return False, f"lease_ttl_exceeded:{lease.lease_ttl_s}s"
         if now - lease.last_heartbeat_at > lease.stall_ttl_s:
-            self._leases[task_id] = dataclass_replace(lease, status="expired_stall")
+            self._leases[task_id] = self._record(dataclass_replace(lease, status="expired_stall"))
             return False, f"stdout_stall_exceeded:{lease.stall_ttl_s}s"
         return True, "alive"
 
     async def run_with_lease(self, task_id: str, specialist: str, harness: str, coro: Awaitable[Any], *, workspace: Path | str = "", lease_ttl_s: float | None = None, stall_ttl_s: float | None = None, on_timeout: Callable[[str, str], Any] | None = None) -> Any:
-        lease = self.acquire_lease(task_id, specialist, harness, workspace=workspace, lease_ttl_s=lease_ttl_s, stall_ttl_s=stall_ttl_s)
+        eff_lease_ttl = self.default_lease_ttl_s if lease_ttl_s is None else lease_ttl_s
+        lease = self.acquire_lease(task_id, specialist, harness, workspace=workspace, lease_ttl_s=eff_lease_ttl, stall_ttl_s=eff_lease_ttl if stall_ttl_s is None else stall_ttl_s)
         positive = [v for v in (lease.lease_ttl_s, lease.stall_ttl_s) if v > 0]
-        try:
-            result = await asyncio.wait_for(coro, timeout=min(positive) if positive else None)
-            self.release_lease(task_id)
-            return result
-        except (asyncio.TimeoutError, TimeoutError) as exc:
-            stall = lease.stall_ttl_s > 0 and (lease.lease_ttl_s <= 0 or lease.stall_ttl_s <= lease.lease_ttl_s)
-            reason = f"stdout_stall_exceeded:{lease.stall_ttl_s}s" if stall else f"lease_ttl_exceeded:{lease.lease_ttl_s}s"
-            self._leases[task_id] = dataclass_replace(lease, status="expired_stall" if stall else "expired_ttl")
+        poll_s = min(0.05, max(0.01, min(positive) / 4.0)) if positive else 0.05
+        task = asyncio.create_task(coro)
+        while not task.done():
+            await asyncio.sleep(poll_s)
+            alive, reason = self.check_liveness(task_id)
+            if alive: continue
+            task.cancel()
+            with suppress(BaseException): await task
             if on_timeout is not None:
                 value = on_timeout(task_id, reason)
                 if asyncio.iscoroutine(value): await value
-            raise TimeoutError(f"Worker {harness!r} on {task_id!r} timed out ({reason})") from exc
+            raise TimeoutError(f"Worker {harness!r} on {task_id!r} timed out ({reason})")
+        result = await task
+        self.release_lease(task_id)
+        return result
 
 
 @dataclass(frozen=True)
@@ -1399,6 +1408,8 @@ class WorktreeManager:
     def salvage_dirty_worktree(self, worktree_path: Path, base_sha: str | None = None, *, task_id: str = "task", forensic_dir: Path | None = None, salvage_policy: str = "clean_reset", test_command: Sequence[str] | None = None) -> WorktreeSalvageReceipt:
         dirty = _nul_paths(_git(worktree_path, "status", "--porcelain=v1", "-z", "-uall", check=False).stdout, status=True)
         resolved = _git(worktree_path, "rev-parse", "--verify", f"{base_sha}^{{commit}}", check=False).stdout.strip() if base_sha else _git(worktree_path, "rev-parse", "HEAD", check=False).stdout.strip()
+        if not resolved: resolved = _git(worktree_path, "rev-parse", "HEAD", check=False).stdout.strip()
+        if not resolved: raise DirtyBaselineError(f"cannot resolve base commit in {worktree_path}")
         head = _git(worktree_path, "rev-parse", "HEAD", check=False).stdout.strip()
         if not dirty and head == resolved: return WorktreeSalvageReceipt(task_id, str(worktree_path), resolved, action="noop")
         diff = _git(worktree_path, "diff", resolved, check=False).stdout
@@ -1410,8 +1421,11 @@ class WorktreeManager:
         patch_file = target / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', task_id)}.forensic.patch"; patch_file.write_text(diff, encoding="utf-8")
         summary = f"Salvaged {len(dirty)} dirty path(s) ({', '.join(dirty[:5])}) from crashed attempt; patch saved to {patch_file.name}" + (f"\n{diff[:400]}" if diff else "")
         if salvage_policy == "carry_forward_if_tests_pass" and test_command:
-            test = subprocess.run(list(test_command), cwd=str(worktree_path), capture_output=True, text=True, timeout=60, check=False)
-            if test.returncode == 0: return WorktreeSalvageReceipt(task_id, str(worktree_path), resolved, tuple(dirty), str(patch_file), summary, "carried_forward", True, False)
+            try:
+                test = subprocess.run(list(test_command), cwd=str(worktree_path), capture_output=True, text=True, timeout=60, check=False)
+                if test.returncode == 0: return WorktreeSalvageReceipt(task_id, str(worktree_path), resolved, tuple(dirty), str(patch_file), summary, "carried_forward", True, False)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
         _git(worktree_path, "reset", "--hard", resolved, check=False); _git(worktree_path, "clean", "-fd", check=False)
         clean = _git(worktree_path, "status", "--porcelain=v1", "-z", "-uall", check=False).stdout == ""
         return WorktreeSalvageReceipt(task_id, str(worktree_path), resolved, tuple(dirty), str(patch_file), summary, "clean_reset", False, clean)
@@ -2445,6 +2459,9 @@ class DagSpecialistRuntime:
                 expected_requirement_ids=expected_ids if require_acc else None,
                 repo_root=Path(self.workdir) if self.workdir else None,
             )
+        if self.ledger is not None:
+            receipt = self.slice_receipts.get(node.id)
+            self.ledger.sqlite_checkpointer.save_checkpoint(self.run_id, node.id, status="completed", head_sha=receipt.head_sha if receipt else "", output=str(result)[:2000])
 
     def on_failure(self, node: Any, prompt: str, exc: BaseException) -> None:
         if not self.enabled or isinstance(exc, (asyncio.CancelledError, RecoveryBlockedError)):
@@ -2687,7 +2704,7 @@ class OmrTaskQueue:
             try:
                 entries = self._read_entries_unlocked(); latest: dict[str, OmrQueueEntry] = {}
                 for entry in entries: latest[entry.task_id] = entry
-                ready = next((e for e in latest.values() if e.status in ("enqueued", "routed") and (specialist is None or e.assigned_specialist == specialist) and (wave is None or e.wave == wave)), None)
+                ready = next((e for e in sorted(latest.values(), key=lambda item: (item.wave, item.seq_id)) if e.status in ("enqueued", "routed") and (specialist is None or e.assigned_specialist == specialist) and (wave is None or e.wave == wave)), None)
                 if ready is None: return None
                 claimed = dataclass_replace(ready, seq_id=max((e.seq_id for e in entries), default=0) + 1, status="running", assigned_harness=harness if harness is not None else ready.assigned_harness, timestamp=self._now_iso())
                 return self._append_entry_unlocked(claimed)
@@ -2873,8 +2890,8 @@ class OmrDispatcher:
         self.gate_policy = GatePolicy.load_default(gate_policy_path)
         self.gate_log_path = self.run_root / "gate_log.json"
         self.lessons_store = LessonsStore(self.history_root / "lessons.jsonl")
-        self.watchdog = WorkerLivenessWatchdog()
         self.checkpointer = SqliteRecoveryCheckpointer(self.run_root / "omr_state.sqlite")
+        self.watchdog = WorkerLivenessWatchdog(checkpointer=self.checkpointer)
 
     def onboard_harness(
         self,
@@ -3277,6 +3294,7 @@ class OmrDispatcher:
         require_skill_evidence: bool = False,
         salvage_on_dirty_crash: bool = False,
         lease_ttl_s: float | None = None,
+        run_id: str | None = None,
         **kwargs: Any,
     ) -> str:
         ws = Path(workspace) if workspace is not None else self.workdir
@@ -3289,11 +3307,13 @@ class OmrDispatcher:
             status="enqueued",
         )
         backend = self.table.backend(specialist_name)
+        eff_run_id = run_id or str(parent_task_id or session_key or "dispatch")
         if backend is None:
             self.queue.transition(task_id, "failed", assigned_specialist=specialist_name, error="unknown specialist")
             raise DagValidationError(f"Specialist {specialist_name!r} not found in SubagentTable")
         self.queue.transition(task_id, "routed", assigned_specialist=specialist_name)
         self.queue.transition(task_id, "running", assigned_specialist=specialist_name)
+        self.checkpointer.save_checkpoint(eff_run_id, task_id, status="running")
         lessons = self.lessons_store.matching_lessons(prompt)
         lessons_block = "\n".join(f"- {lesson['rule']}" for lesson in lessons)
         lesson_prompt = f"{prompt}\n\n[Active Lessons]\n{lessons_block}" if lessons else prompt
@@ -3312,7 +3332,8 @@ class OmrDispatcher:
                 **kwargs,
             )
             result = await self.watchdog.run_with_lease(task_id, specialist_name, getattr(backend, "name", specialist_name), run_coro, workspace=ws, lease_ttl_s=lease_ttl_s) if lease_ttl_s is not None else await run_coro
-            self.checkpointer.save_checkpoint("dispatch", task_id, status="completed", output=str(result))
+            self.checkpointer.save_checkpoint(eff_run_id, task_id, status="completed", output=str(result))
+            if eff_run_id != "dispatch": self.checkpointer.save_checkpoint("dispatch", task_id, status="completed", output=str(result))
             chosen_harness = str(getattr(backend, "last_chosen_backend", "") or getattr(backend, "name", "") or "")
             node_stub = DagNodeSpec(
                 id=re.sub(r"[^A-Za-z0-9_-]", "_", task_id)[:60] or "node",
@@ -3338,6 +3359,9 @@ class OmrDispatcher:
                 self.record_lesson(prompt, "Provide verifiable done-gate evidence before completion.", task_id)
             return result
         except BaseException as exc:
+            salvage = getattr(backend, "last_salvage_receipts", None)
+            if salvage is not None: salvage = {"receipts": [r.to_dict() if hasattr(r, "to_dict") else r for r in salvage]}
+            self.checkpointer.save_checkpoint(eff_run_id, task_id, status="failed", salvage=salvage)
             chosen_harness = str(getattr(backend, "last_chosen_backend", "") or getattr(backend, "name", "") or "")
             self.queue.transition(
                 task_id,
