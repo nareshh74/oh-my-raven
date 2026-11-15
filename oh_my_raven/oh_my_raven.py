@@ -10,11 +10,15 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
-from dataclasses import dataclass, field, replace as dataclass_replace
+import time
+from contextlib import closing, suppress
+from dataclasses import asdict, dataclass, field, replace as dataclass_replace
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Literal, Mapping, Sequence
 
 from loguru import logger
 
@@ -1303,7 +1307,128 @@ def _nul_paths(value: str, *, status: bool = False) -> list[str]:
     return paths
 
 
+@dataclass(frozen=True)
+class WorkerLease:
+    task_id: str
+    specialist: str
+    harness: str
+    workspace: str = ""
+    lease_ttl_s: float = 180.0
+    stall_ttl_s: float = 60.0
+    acquired_at: float = 0.0
+    last_heartbeat_at: float = 0.0
+    pid: int | None = None
+    status: str = "active"
+
+
+class WorkerLivenessWatchdog:
+    def __init__(self, *, default_lease_ttl_s: float = 180.0, default_stall_ttl_s: float = 60.0, clock: Callable[[], float] = time.monotonic, checkpointer: SqliteRecoveryCheckpointer | None = None) -> None:
+        self.default_lease_ttl_s, self.default_stall_ttl_s, self._clock = default_lease_ttl_s, default_stall_ttl_s, clock
+        self.checkpointer = checkpointer
+        self._leases: dict[str, WorkerLease] = {}
+
+    def _record(self, lease: WorkerLease) -> WorkerLease:
+        if self.checkpointer is not None: self.checkpointer.record_lease(lease)
+        return lease
+
+    def acquire_lease(self, task_id: str, specialist: str, harness: str, *, workspace: Path | str = "", lease_ttl_s: float | None = None, stall_ttl_s: float | None = None, pid: int | None = None) -> WorkerLease:
+        now = self._clock()
+        lease = WorkerLease(task_id, specialist, harness, str(workspace), self.default_lease_ttl_s if lease_ttl_s is None else lease_ttl_s, self.default_stall_ttl_s if stall_ttl_s is None else stall_ttl_s, now, now, pid)
+        self._leases[task_id] = lease
+        return self._record(lease)
+
+    def heartbeat(self, task_id: str, *, pid: int | None = None) -> WorkerLease | None:
+        lease = self._leases.get(task_id)
+        if lease is None: return None
+        lease = dataclass_replace(lease, last_heartbeat_at=self._clock(), pid=lease.pid if pid is None else pid)
+        self._leases[task_id] = lease
+        return self._record(lease)
+
+    def release_lease(self, task_id: str) -> WorkerLease | None:
+        lease = self._leases.get(task_id)
+        if lease is None: return None
+        lease = dataclass_replace(lease, status="released"); self._leases[task_id] = lease
+        return self._record(lease)
+
+    def check_liveness(self, task_id: str) -> tuple[bool, str]:
+        lease = self._leases.get(task_id)
+        if lease is None or lease.status != "active": return True, "alive"
+        now = self._clock()
+        if now - lease.acquired_at > lease.lease_ttl_s:
+            self._leases[task_id] = self._record(dataclass_replace(lease, status="expired_ttl"))
+            return False, f"lease_ttl_exceeded:{lease.lease_ttl_s}s"
+        if now - lease.last_heartbeat_at > lease.stall_ttl_s:
+            self._leases[task_id] = self._record(dataclass_replace(lease, status="expired_stall"))
+            return False, f"stdout_stall_exceeded:{lease.stall_ttl_s}s"
+        return True, "alive"
+
+    async def run_with_lease(self, task_id: str, specialist: str, harness: str, coro: Awaitable[Any], *, workspace: Path | str = "", lease_ttl_s: float | None = None, stall_ttl_s: float | None = None, on_timeout: Callable[[str, str], Any] | None = None) -> Any:
+        eff_lease_ttl = self.default_lease_ttl_s if lease_ttl_s is None else lease_ttl_s
+        lease = self.acquire_lease(task_id, specialist, harness, workspace=workspace, lease_ttl_s=eff_lease_ttl, stall_ttl_s=eff_lease_ttl if stall_ttl_s is None else stall_ttl_s)
+        positive = [v for v in (lease.lease_ttl_s, lease.stall_ttl_s) if v > 0]
+        poll_s = min(0.05, max(0.01, min(positive) / 4.0)) if positive else 0.05
+        task = asyncio.create_task(coro)
+        while not task.done():
+            await asyncio.sleep(poll_s)
+            alive, reason = self.check_liveness(task_id)
+            if alive: continue
+            task.cancel()
+            with suppress(BaseException): await task
+            if on_timeout is not None:
+                value = on_timeout(task_id, reason)
+                if asyncio.iscoroutine(value): await value
+            raise TimeoutError(f"Worker {harness!r} on {task_id!r} timed out ({reason})")
+        result = await task
+        self.release_lease(task_id)
+        return result
+
+
+@dataclass(frozen=True)
+class WorktreeSalvageReceipt:
+    task_id: str
+    worktree_path: str
+    base_sha: str
+    dirty_paths: tuple[str, ...] = ()
+    patch_path: str = ""
+    diff_summary: str = ""
+    action: str = "clean_reset"
+    tests_passed: bool = False
+    restored_clean: bool = True
+
+    def __getitem__(self, key: str) -> Any: return getattr(self, key)
+    def get(self, key: str, default: Any = None) -> Any: return getattr(self, key, default)
+    def keys(self) -> tuple[str, ...]: return ("task_id", "worktree_path", "base_sha", "dirty_paths", "patch_path", "diff_summary", "action", "tests_passed", "restored_clean")
+    def to_dict(self) -> dict[str, Any]: return {k: getattr(self, k) for k in self.keys()}
+
+    def format_forensic_brief(self) -> str:
+        return f"[BEGIN FORENSIC CRASH SALVAGE]\nPrevious worker crashed/timed out after modifying: {', '.join(self.dirty_paths)}.\nAction taken: {self.action} (worktree reset to {self.base_sha[:12] if self.base_sha else 'HEAD'}).\nForensic patch: {self.patch_path}\nDiff summary:\n{self.diff_summary}\n[END FORENSIC CRASH SALVAGE]"
+
+
 class WorktreeManager:
+    def salvage_dirty_worktree(self, worktree_path: Path, base_sha: str | None = None, *, task_id: str = "task", forensic_dir: Path | None = None, salvage_policy: str = "clean_reset", test_command: Sequence[str] | None = None) -> WorktreeSalvageReceipt:
+        dirty = _nul_paths(_git(worktree_path, "status", "--porcelain=v1", "-z", "-uall", check=False).stdout, status=True)
+        resolved = _git(worktree_path, "rev-parse", "--verify", f"{base_sha}^{{commit}}", check=False).stdout.strip() if base_sha else _git(worktree_path, "rev-parse", "HEAD", check=False).stdout.strip()
+        if not resolved: resolved = _git(worktree_path, "rev-parse", "HEAD", check=False).stdout.strip()
+        if not resolved: raise DirtyBaselineError(f"cannot resolve base commit in {worktree_path}")
+        head = _git(worktree_path, "rev-parse", "HEAD", check=False).stdout.strip()
+        if not dirty and head == resolved: return WorktreeSalvageReceipt(task_id, str(worktree_path), resolved, action="noop")
+        diff = _git(worktree_path, "diff", resolved, check=False).stdout
+        for path in dirty:
+            candidate = worktree_path / path
+            if candidate.is_file() and not _git(worktree_path, "ls-files", "--error-unmatch", path, check=False).returncode == 0:
+                diff += f"\n--- untracked: {path} ---\n" + candidate.read_text(encoding="utf-8", errors="replace")[:4000]
+        target = forensic_dir or worktree_path.parent / ".omr_forensics"; target.mkdir(parents=True, exist_ok=True)
+        patch_file = target / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', task_id)}.forensic.patch"; patch_file.write_text(diff, encoding="utf-8")
+        summary = f"Salvaged {len(dirty)} dirty path(s) ({', '.join(dirty[:5])}) from crashed attempt; patch saved to {patch_file.name}" + (f"\n{diff[:400]}" if diff else "")
+        if salvage_policy == "carry_forward_if_tests_pass" and test_command:
+            try:
+                test = subprocess.run(list(test_command), cwd=str(worktree_path), capture_output=True, text=True, timeout=60, check=False)
+                if test.returncode == 0: return WorktreeSalvageReceipt(task_id, str(worktree_path), resolved, tuple(dirty), str(patch_file), summary, "carried_forward", True, False)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        _git(worktree_path, "reset", "--hard", resolved, check=False); _git(worktree_path, "clean", "-fd", check=False)
+        clean = _git(worktree_path, "status", "--porcelain=v1", "-z", "-uall", check=False).stdout == ""
+        return WorktreeSalvageReceipt(task_id, str(worktree_path), resolved, tuple(dirty), str(patch_file), summary, "clean_reset", False, clean)
     def verify_clean_baseline(self, worktree_path: Path, expected_head_sha: str | None = None) -> None:
         if _git(worktree_path, "status", "--porcelain=v1", "-z", "-uall").stdout:
             raise DirtyBaselineError(f"baseline repository is dirty: {worktree_path}")
@@ -1429,9 +1554,40 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+class SqliteRecoveryCheckpointer:
+    def __init__(self, db_path: Path | str) -> None:
+        self.db_path = Path(db_path); self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            with db:
+                db.execute("CREATE TABLE IF NOT EXISTS node_checkpoints (run_id TEXT, node_id TEXT, status TEXT, head_sha TEXT, output TEXT, salvage_json TEXT, attempt_count INTEGER, updated_at TEXT, PRIMARY KEY (run_id, node_id))")
+                db.execute("CREATE TABLE IF NOT EXISTS task_leases (task_id TEXT PRIMARY KEY, specialist TEXT, harness TEXT, status TEXT, lease_json TEXT, updated_at TEXT)")
+
+    def save_checkpoint(self, run_id: str, node_id: str, *, status: str, head_sha: str = "", output: str = "", salvage: dict[str, Any] | None = None, attempt_count: int = 1) -> dict[str, Any]:
+        updated_at = datetime.now(timezone.utc).isoformat(); salvage = salvage or {}
+        with closing(sqlite3.connect(self.db_path)) as db:
+            with db:
+                db.execute("INSERT OR REPLACE INTO node_checkpoints VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (run_id, node_id, status, head_sha, output, json.dumps(salvage), attempt_count, updated_at))
+        return {"run_id": run_id, "node_id": node_id, "status": status, "head_sha": head_sha, "output": output, "salvage": salvage, "attempt_count": attempt_count, "updated_at": updated_at}
+
+    def get_checkpoint(self, run_id: str, node_id: str) -> dict[str, Any] | None:
+        with closing(sqlite3.connect(self.db_path)) as db: row = db.execute("SELECT * FROM node_checkpoints WHERE run_id=? AND node_id=?", (run_id, node_id)).fetchone()
+        if row is None: return None
+        return dict(zip(("run_id", "node_id", "status", "head_sha", "output", "salvage_json", "attempt_count", "updated_at"), row)) | {"salvage": json.loads(row[5] or "{}")}
+
+    def list_completed_nodes(self, run_id: str) -> dict[str, dict[str, Any]]:
+        with closing(sqlite3.connect(self.db_path)) as db: ids = [r[0] for r in db.execute("SELECT node_id FROM node_checkpoints WHERE run_id=? AND status='completed'", (run_id,))]
+        return {node_id: self.get_checkpoint(run_id, node_id) for node_id in ids}  # type: ignore[misc]
+
+    def record_lease(self, lease: WorkerLease) -> None:
+        with closing(sqlite3.connect(self.db_path)) as db:
+            with db:
+                db.execute("INSERT OR REPLACE INTO task_leases VALUES (?, ?, ?, ?, ?, ?)", (lease.task_id, lease.specialist, lease.harness, lease.status, json.dumps(asdict(lease)), datetime.now(timezone.utc).isoformat()))
+
+
 class DurableRecoveryLedger:
-    def __init__(self, ledger_path: Path) -> None:
+    def __init__(self, ledger_path: Path, *, sqlite_path: Path | str | None = None) -> None:
         self.ledger_path = ledger_path
+        self.sqlite_checkpointer = SqliteRecoveryCheckpointer(sqlite_path or ledger_path.with_suffix(".sqlite"))
 
     def _records(self) -> dict[str, Any]:
         return json.loads(self.ledger_path.read_text(encoding="utf-8")) if self.ledger_path.exists() else {}
@@ -1448,6 +1604,8 @@ class DurableRecoveryLedger:
         committed_sha: str = "",
         dirty_paths: Sequence[str] = (),
         max_attempts: int = 2,
+        salvaged: bool = False,
+        salvage_receipt: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         records, key = self._records(), f"{run_id}:{node_id}:{input_hash}"
         record = records.get(key, {"attempt_count": 0})
@@ -1462,11 +1620,12 @@ class DurableRecoveryLedger:
             record["next_action"] = "cancelled"
         else:
             record["attempt_count"] += 1
-            record["next_action"] = (
-                "quarantine" if dirty_paths else "escalate" if record["attempt_count"] >= max_attempts else "retry"
-            )
+            record["next_action"] = "quarantine" if dirty_paths and not salvaged else "escalate" if record["attempt_count"] >= max_attempts else "retry"
+        if salvaged:
+            record["salvaged"], record["salvage_receipt"] = True, salvage_receipt or {}
         records[key] = record
         _write_json(self.ledger_path, records)
+        self.sqlite_checkpointer.save_checkpoint(run_id, node_id, status=record["next_action"], head_sha=committed_sha, output=json.dumps(record), salvage=record.get("salvage_receipt"), attempt_count=record["attempt_count"])
         return record
 
     def reconcile(
@@ -2300,6 +2459,9 @@ class DagSpecialistRuntime:
                 expected_requirement_ids=expected_ids if require_acc else None,
                 repo_root=Path(self.workdir) if self.workdir else None,
             )
+        if self.ledger is not None:
+            receipt = self.slice_receipts.get(node.id)
+            self.ledger.sqlite_checkpointer.save_checkpoint(self.run_id, node.id, status="completed", head_sha=receipt.head_sha if receipt else "", output=str(result)[:2000])
 
     def on_failure(self, node: Any, prompt: str, exc: BaseException) -> None:
         if not self.enabled or isinstance(exc, (asyncio.CancelledError, RecoveryBlockedError)):
@@ -2535,6 +2697,20 @@ class OmrTaskQueue:
             finally:
                 self._release_file_lock(lock_fh)
 
+    def claim_ready(self, *, specialist: str | None = None, harness: str | None = None, wave: int | None = None) -> OmrQueueEntry | None:
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+b") as lock_fh:
+            self._acquire_file_lock(lock_fh)
+            try:
+                entries = self._read_entries_unlocked(); latest: dict[str, OmrQueueEntry] = {}
+                for entry in entries: latest[entry.task_id] = entry
+                ready = next((e for e in sorted(latest.values(), key=lambda item: (item.wave, item.seq_id)) if e.status in ("enqueued", "routed") and (specialist is None or e.assigned_specialist == specialist) and (wave is None or e.wave == wave)), None)
+                if ready is None: return None
+                claimed = dataclass_replace(ready, seq_id=max((e.seq_id for e in entries), default=0) + 1, status="running", assigned_harness=harness if harness is not None else ready.assigned_harness, timestamp=self._now_iso())
+                return self._append_entry_unlocked(claimed)
+            finally:
+                self._release_file_lock(lock_fh)
+
 
 @dataclass(frozen=True)
 class DecompositionPlan:
@@ -2714,6 +2890,8 @@ class OmrDispatcher:
         self.gate_policy = GatePolicy.load_default(gate_policy_path)
         self.gate_log_path = self.run_root / "gate_log.json"
         self.lessons_store = LessonsStore(self.history_root / "lessons.jsonl")
+        self.checkpointer = SqliteRecoveryCheckpointer(self.run_root / "omr_state.sqlite")
+        self.watchdog = WorkerLivenessWatchdog(checkpointer=self.checkpointer)
 
     def onboard_harness(
         self,
@@ -2759,6 +2937,8 @@ class OmrDispatcher:
         specialist_definition: SpecialistDefinition | dict[str, Any] | Path | str | None = None,
         specialists_root: Path | str | None = None,
         require_skill_evidence: bool = False,
+        salvage_on_dirty_crash: bool = False,
+        lease_ttl_s: float | None = None,
     ) -> RoutingBackend:
         """Register a profile-free specialist over an existing runtime harness pool."""
         raw_targets = list(targets) if isinstance(targets, (list, tuple)) else [RouteTarget(name, name, targets)]
@@ -3112,6 +3292,9 @@ class OmrDispatcher:
         writes: bool = False,
         idempotent: bool = True,
         require_skill_evidence: bool = False,
+        salvage_on_dirty_crash: bool = False,
+        lease_ttl_s: float | None = None,
+        run_id: str | None = None,
         **kwargs: Any,
     ) -> str:
         ws = Path(workspace) if workspace is not None else self.workdir
@@ -3124,17 +3307,19 @@ class OmrDispatcher:
             status="enqueued",
         )
         backend = self.table.backend(specialist_name)
+        eff_run_id = run_id or str(parent_task_id or session_key or "dispatch")
         if backend is None:
             self.queue.transition(task_id, "failed", assigned_specialist=specialist_name, error="unknown specialist")
             raise DagValidationError(f"Specialist {specialist_name!r} not found in SubagentTable")
         self.queue.transition(task_id, "routed", assigned_specialist=specialist_name)
         self.queue.transition(task_id, "running", assigned_specialist=specialist_name)
+        self.checkpointer.save_checkpoint(eff_run_id, task_id, status="running")
         lessons = self.lessons_store.matching_lessons(prompt)
         lessons_block = "\n".join(f"- {lesson['rule']}" for lesson in lessons)
         lesson_prompt = f"{prompt}\n\n[Active Lessons]\n{lessons_block}" if lessons else prompt
         framed_prompt = self._build_framed_prompt(lesson_prompt)
         try:
-            result = await backend.run(
+            run_coro = backend.run(
                 framed_prompt,
                 task_id=task_id,
                 workspace=ws,
@@ -3143,8 +3328,12 @@ class OmrDispatcher:
                 authored_task=prompt,
                 writes=writes,
                 idempotent=idempotent,
+                salvage_on_dirty_crash=salvage_on_dirty_crash,
                 **kwargs,
             )
+            result = await self.watchdog.run_with_lease(task_id, specialist_name, getattr(backend, "name", specialist_name), run_coro, workspace=ws, lease_ttl_s=lease_ttl_s) if lease_ttl_s is not None else await run_coro
+            self.checkpointer.save_checkpoint(eff_run_id, task_id, status="completed", output=str(result))
+            if eff_run_id != "dispatch": self.checkpointer.save_checkpoint("dispatch", task_id, status="completed", output=str(result))
             chosen_harness = str(getattr(backend, "last_chosen_backend", "") or getattr(backend, "name", "") or "")
             node_stub = DagNodeSpec(
                 id=re.sub(r"[^A-Za-z0-9_-]", "_", task_id)[:60] or "node",
@@ -3170,6 +3359,9 @@ class OmrDispatcher:
                 self.record_lesson(prompt, "Provide verifiable done-gate evidence before completion.", task_id)
             return result
         except BaseException as exc:
+            salvage = getattr(backend, "last_salvage_receipts", None)
+            if salvage is not None: salvage = {"receipts": [r.to_dict() if hasattr(r, "to_dict") else r for r in salvage]}
+            self.checkpointer.save_checkpoint(eff_run_id, task_id, status="failed", salvage=salvage)
             chosen_harness = str(getattr(backend, "last_chosen_backend", "") or getattr(backend, "name", "") or "")
             self.queue.transition(
                 task_id,
@@ -3351,7 +3543,11 @@ __all__ = [
     "SpecialistFolderManager",
     "SpecialistPlaceholderBackend",
     "StaleReviewError",
+    "SqliteRecoveryCheckpointer",
+    "WorkerLease",
+    "WorkerLivenessWatchdog",
     "WorktreeManager",
+    "WorktreeSalvageReceipt",
     "build_autonomous_feature_delivery_playbook",
     "build_context_charter",
     "build_holistic_charter",

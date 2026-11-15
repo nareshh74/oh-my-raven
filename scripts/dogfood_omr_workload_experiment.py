@@ -1,4 +1,4 @@
-"""Live dogfood experiment: 6 realistic workloads through oh_my_raven with real git, subprocesses and OTel spans.
+"""Live dogfood experiment: 8 realistic workloads through oh_my_raven with real git, subprocesses and OTel spans.
 
 Usage: python scripts/dogfood_omr_workload_experiment.py [--write-report]
 Spans use the OTel SDK when installed, otherwise a tiny recording TracerProvider built on opentelemetry-api.
@@ -371,6 +371,49 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
                 "chosen_backend": chosen, "worktree_clean": clean}
     timed("W7_per_specialist_folder_agents_md_and_session_flag_failover", w7)
 
+
+    def w8():
+        wt = _wt(repo, tmp, "w8")
+        seen: dict[str, Any] = {}
+
+        def crash(s, task, kw):
+            (wt / "partial_feature.py").write_text("def half(:\n", encoding="utf-8")
+            raise TimeoutError("worker hung mid-edit")
+
+        def recover(s, task, kw):
+            seen["task"] = task
+            seen["clean"] = git(wt, "status", "--porcelain", "-uall") == ""
+            (wt / "clean_feature.py").write_text("X = 1\n", encoding="utf-8")
+            git(wt, "add", "-A")
+            git(wt, "commit", "-q", "-m", "clean feature")
+            return json.dumps({"evidence": {"artifact_path": "clean_feature.py"}})
+        b1, b2 = Stub("Claude-Code", crash), Stub("Codex-CLI", recover)
+        rb = routing("Crasher", b1, [b2], telemetry, salvage_on_dirty_crash=True)
+        table.onboard("Crasher", rb)
+        d.workdir = wt
+        try:
+            asyncio.run(d.dispatch_specialist_node("W8", "Crasher", "build feature", workspace=wt, writes=True,
+                                                   salvage_on_dirty_crash=True))
+        finally:
+            d.workdir = repo
+        rcpts = rb.last_salvage_receipts
+        patch_ok = bool(rcpts and Path(rcpts[0].patch_path).is_file())
+        cp = d.checkpointer.get_checkpoint("dispatch", "W8")
+        cp_ok = bool(cp and cp["status"] == "completed")
+        injected = "[BEGIN FORENSIC CRASH SALVAGE]" in seen.get("task", "")
+        clean = git(wt, "status", "--porcelain", "-uall") == ""
+        d.queue.enqueue("W8q", "claim me", assigned_specialist="Crasher", wave=0, status="enqueued")
+        claimed = d.queue.claim_ready()
+        claim_ok = bool(claimed and claimed.task_id == "W8q" and d.queue.claim_ready() is None)
+        chosen = str(rb.last_chosen_backend)
+        salvaged = bool(rcpts)
+        return {"ok": bool(salvaged and patch_ok and injected and cp_ok and clean and claim_ok and seen.get("clean")
+                           and chosen == "Codex-CLI"),
+                "salvaged": salvaged, "forensic_patch_exists": patch_ok, "brief_injected": injected,
+                "sqlite_checkpoint_ok": cp_ok, "worktree_clean": clean, "queue_claim_ok": claim_ok,
+                "chosen_backend": chosen}
+    timed("W8_durable_worker_crash_salvage_and_sqlite_resume", w8)
+
     spans = _span_rows(cap)
     by_name = Counter(s["name"] for s in spans)
     attempt_events = sum(1 for s in spans for e in s["events"] if e["name"] == "omr.routing.attempt")
@@ -379,7 +422,7 @@ def _run(tmp: Path, cap: list) -> dict[str, Any]:
     return {
         "span_capture": cap_kind,
         "workloads": results,
-        "all_ok": len(results) == 7 and all(r["ok"] for r in results.values()),
+        "all_ok": len(results) == 8 and all(r["ok"] for r in results.values()),
         "spans_total": len(spans),
         "spans_by_name": dict(sorted(by_name.items())),
         "routing_attempt_events": attempt_events,
@@ -401,7 +444,7 @@ def render_report(s: dict[str, Any]) -> str:
     for k, r in s["workloads"].items():
         detail = ", ".join(f"{a}={b}" for a, b in r.items() if a not in ("ok", "latency_ms"))
         lines.append(f"| {k} | {r['ok']} | {r['latency_ms']} | {detail} |")
-    lines += ["", f"All 7 workloads OK: **{s['all_ok']}**", "", "## Monitoring receipts", "",
+    lines += ["", f"All 8 workloads OK: **{s['all_ok']}**", "", "## Monitoring receipts", "",
               f"- OTel spans captured: {s['spans_total']} (`{json.dumps(s['spans_by_name'])}`)",
               f"- `omr.routing.attempt` events: {s['routing_attempt_events']}",
               f"- `gate_log.json` entries: {s['gate_log_entries']} (`{json.dumps(s['gate_log_gates'])}`)",

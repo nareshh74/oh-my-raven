@@ -7,21 +7,22 @@ Span capture: owned recording tracer bound to oh_my_raven.gate/routing.
 
 | Workload | OK | Latency (ms) | Detail |
 |---|---|---|---|
-| W1_trivial_fast_path | True | 90.63 | tier=trivial, status=completed, specialist_turns=1 |
-| W2_council_plan_review | True | 37.99 | first_consensus=False, second_consensus=True, gaps=['missing edge-case test for empty input'] |
-| W3_ambiguity_experiment | True | 214.28 | proceed=True, resolved_by=experiment |
-| W4_premature_completion_lesson_loop | True | 10325.2 | first_status=incomplete, retry_status=completed, lessons_injected=True |
-| W5_crash_revival_failover_hot_onboard | True | 3128.67 | attempts=['failed', 'succeeded'], claude_calls=1, chosen_backend=Windsurf-ACP, committed=True, status=completed, onboard_logged=True |
-| W6_irreversible_action_blocked | True | 0.05 | blocked=True, callback_ran=False |
-| W7_per_specialist_folder_agents_md_and_session_flag_failover | True | 3323.7 | bucket1_reconciled=True, gstack_in_bucket2=True, specialist_dir_created=True, agents_md_loaded=True, claude_flags_ok=True, codex_flags_ok=True, model_config_ok=True, first_attempt_error=SkillContractViolationError, chosen_backend=Codex-CLI, worktree_clean=True |
+| W1_trivial_fast_path | True | 92.82 | tier=trivial, status=completed, specialist_turns=1 |
+| W2_council_plan_review | True | 24.8 | first_consensus=False, second_consensus=True, gaps=['missing edge-case test for empty input'] |
+| W3_ambiguity_experiment | True | 156.08 | proceed=True, resolved_by=experiment |
+| W4_premature_completion_lesson_loop | True | 4767.55 | first_status=incomplete, retry_status=completed, lessons_injected=True |
+| W5_crash_revival_failover_hot_onboard | True | 2415.17 | attempts=['failed', 'succeeded'], claude_calls=1, chosen_backend=Windsurf-ACP, committed=True, status=completed, onboard_logged=True |
+| W6_irreversible_action_blocked | True | 0.04 | blocked=True, callback_ran=False |
+| W7_per_specialist_folder_agents_md_and_session_flag_failover | True | 2371.33 | bucket1_reconciled=True, gstack_in_bucket2=True, specialist_dir_created=True, agents_md_loaded=True, claude_flags_ok=True, codex_flags_ok=True, model_config_ok=True, first_attempt_error=SkillContractViolationError, chosen_backend=Codex-CLI, worktree_clean=True |
+| W8_durable_worker_crash_salvage_and_sqlite_resume | True | 3020.03 | salvaged=True, forensic_patch_exists=True, brief_injected=True, sqlite_checkpoint_ok=True, worktree_clean=True, queue_claim_ok=True, chosen_backend=Codex-CLI |
 
-All 7 workloads OK: **True**
+All 8 workloads OK: **True**
 
 ## Monitoring receipts
 
-- OTel spans captured: 15 (`{"omr.council.consensus": 2, "omr.gate.plan_gap_fill": 1, "omr.gate.push": 1, "omr.gate.technical_decision": 6, "omr.routing.run": 5}`)
-- `omr.routing.attempt` events: 7
+- OTel spans captured: 16 (`{"omr.council.consensus": 2, "omr.gate.plan_gap_fill": 1, "omr.gate.push": 1, "omr.gate.technical_decision": 6, "omr.routing.run": 6}`)
+- `omr.routing.attempt` events: 9
 - `gate_log.json` entries: 7 (`{"plan_gap_fill": 1, "technical_decision": 6}`)
-- `queue_ledger.jsonl` rows: 20 (`{"enqueued": 5, "routed": 5, "running": 5, "completed": 4, "incomplete": 1}`)
-- `specialist_telemetry.jsonl` rows: 3
+- `queue_ledger.jsonl` rows: 26 (`{"enqueued": 7, "routed": 6, "running": 7, "completed": 5, "incomplete": 1}`)
+- `specialist_telemetry.jsonl` rows: 4
 - `lessons.jsonl` rows: 2

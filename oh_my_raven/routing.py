@@ -373,6 +373,9 @@ class RoutingBackend(SubagentBackend):
         specialist_definition: Any = None,
         is_dynamic_specialist: bool = False,
         pool_load_state: dict[str, dict[str, int]] | None = None,
+        salvage_on_dirty_crash: bool = False,
+        worktree_salvager: Callable[[Path, str], Any] | None = None,
+        attempt_timeout_s: float | None = None,
     ) -> None:
         """``targets`` are ``(name, description, backend)`` in route order.
 
@@ -405,6 +408,11 @@ class RoutingBackend(SubagentBackend):
         self._clock = clock
         self._telemetry_path = Path(telemetry_path) if telemetry_path is not None else None
         self._worktree_dirty_check = worktree_dirty_check
+        self._salvage_on_dirty_crash = bool(salvage_on_dirty_crash)
+        self._worktree_salvager = worktree_salvager
+        self._attempt_timeout_s = float(attempt_timeout_s) if attempt_timeout_s is not None else None
+        self.last_salvage_receipts: list[Any] = []
+        self._pending_forensic_brief = ""
         self._cooldown_until: dict[str, float] = {}
         self._instance_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._session_dir_resolver: Callable[..., Any] | None = None
@@ -857,6 +865,7 @@ class RoutingBackend(SubagentBackend):
         reasoning_effort: str = "",
         model_resolution_source: str = "",
         model_fallback_used: bool = False,
+        salvage_receipts: Sequence[Any] = (),
     ) -> None:
         tpath = self._resolve_telemetry_path(session_key)
         if tpath is None:
@@ -893,6 +902,9 @@ class RoutingBackend(SubagentBackend):
             "model_resolution_source": model_resolution_source,
             "model_fallback_used": bool(model_fallback_used),
         }
+        if salvage_receipts:
+            from dataclasses import asdict
+            record["salvage_receipts"] = [r.to_dict() if hasattr(r, "to_dict") else (dict(r) if isinstance(r, dict) else asdict(r)) for r in salvage_receipts]
         if resolved_model and not model:
             record["model"] = resolved_model
         TelemetryLogger(tpath).write_record(record)
@@ -978,7 +990,7 @@ class RoutingBackend(SubagentBackend):
         run_start: float,
         telemetry_extra: dict[str, Any],
         exc: BaseException,
-    ) -> None:
+    ) -> dict[str, Any]:
         has_cleanup_hook = callable(getattr(candidate.backend, "cleanup_attempt", None)) or callable(
             getattr(candidate.backend, "cancel", None)
         )
@@ -1008,6 +1020,19 @@ class RoutingBackend(SubagentBackend):
                 attempt_receipts=attempt_records,
             ) from exc
         dirty_paths = self._check_dirty_worktree(workspace)
+        salvage_enabled = bool(call_kwargs.get("salvage_on_dirty_crash", self._salvage_on_dirty_crash)) or self._worktree_salvager is not None
+        if dirty_paths and salvage_enabled and idempotent:
+            if self._worktree_salvager is not None:
+                salvage = self._worktree_salvager(workspace, task_id)
+            else:
+                from raven.agent.subagent.oh_my_raven import WorktreeManager
+                salvage = WorktreeManager().salvage_dirty_worktree(workspace, call_kwargs.get("base_sha"), task_id=task_id, forensic_dir=call_kwargs.get("forensic_dir"))
+            if getattr(salvage, "restored_clean", False) or getattr(salvage, "action", "") == "carried_forward":
+                from dataclasses import asdict
+                data = asdict(salvage) if hasattr(salvage, "__dataclass_fields__") else dict(salvage)
+                self.last_salvage_receipts.append(salvage)
+                self._pending_forensic_brief = salvage.format_forensic_brief() if hasattr(salvage, "format_forensic_brief") else str(data)
+                return {"salvaged_dirty_worktree": True, "dirty_paths": dirty_paths, "salvage_action": data.get("action", ""), "forensic_patch": data.get("patch_path", ""), "forensic_summary": data.get("diff_summary", "")}
         if dirty_paths or not idempotent:
             receipt = {
                 "backend": candidate.name,
@@ -1033,6 +1058,7 @@ class RoutingBackend(SubagentBackend):
                 f"{self.name!r}: failover blocked after {candidate.name!r} failed with {error_class} and left dirty paths {dirty_paths!r}",
                 attempt_receipts=attempt_records,
             ) from exc
+        return {}
 
     async def _handle_attempt_exception(
         self,
@@ -1076,8 +1102,9 @@ class RoutingBackend(SubagentBackend):
             )
             raise exc
         cleaned = await self._cleanup_failed_attempt(candidate.backend, task_id, workspace)
+        salvage_fields: dict[str, Any] = {}
         if writes:
-            self._verify_write_failover_safety(
+            salvage_fields = self._verify_write_failover_safety(
                 candidate=candidate,
                 cleaned=cleaned,
                 idempotent=idempotent,
@@ -1094,7 +1121,7 @@ class RoutingBackend(SubagentBackend):
                 exc=exc,
             )
         attempt_records.append(
-            {"backend": candidate.name, "status": "failed", "error_class": error_class, "duration_ms": duration_ms, **session_fields}
+            {"backend": candidate.name, "status": "failed", "error_class": error_class, "duration_ms": duration_ms, **salvage_fields, **session_fields}
         )
         self._record_cooldown(candidate.name)
         await self._unbind_failed_instance(session_key, candidate.name, instance)
@@ -1123,6 +1150,8 @@ class RoutingBackend(SubagentBackend):
         **kwargs: Any,
     ) -> str:
         base_task = task
+        self.last_salvage_receipts = []
+        self._pending_forensic_brief = ""
         base_authored_task = authored_task
         mode = kwargs.get("mode")
         media_items = kwargs.get("media") or ()
@@ -1161,6 +1190,8 @@ class RoutingBackend(SubagentBackend):
             session_bundle: dict[str, Any] = {}
             session_kwargs: dict[str, Any] = {}
             attempt_task = f"{base_task}{candidate.note}" if candidate.note else base_task
+            if idx > 0 and self._pending_forensic_brief:
+                attempt_task += f"\n\n{self._pending_forensic_brief}"
             attempt_authored = (
                 f"{base_authored_task}{candidate.note}"
                 if (base_authored_task is not None and candidate.note)
@@ -1208,7 +1239,8 @@ class RoutingBackend(SubagentBackend):
                                 setattr(candidate.backend, attr, None)
                             except (AttributeError, TypeError):
                                 pass
-                result = await candidate.backend.run(
+                pre_run_backend_id = getattr(candidate.backend, "execution_identity", None)
+                run_coro = candidate.backend.run(
                     attempt_task,
                     task_id=task_id,
                     workspace=workspace,
@@ -1219,7 +1251,13 @@ class RoutingBackend(SubagentBackend):
                     **session_kwargs,
                     **call_kwargs,
                 )
+                timeout = call_kwargs.get("attempt_timeout_s", self._attempt_timeout_s)
+                try:
+                    result = await asyncio.wait_for(run_coro, timeout=float(timeout)) if timeout is not None and float(timeout) > 0 else await run_coro
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError(f"attempt on {candidate.name!r} timed out") from exc
                 self._forward_candidate_attributes(candidate.name, candidate.backend)
+                post_run_backend_id = getattr(candidate.backend, "execution_identity", None)
                 if session_bundle:
                     self.last_resolved_model = session_bundle.get("resolved_model", ""); self.last_canonical_model = session_bundle.get("canonical_model", ""); self.last_resolved_provider = session_bundle.get("resolved_provider", ""); self.last_resolved_model_family = session_bundle.get("resolved_model_family", ""); self.last_reasoning_effort = session_bundle.get("reasoning_effort", "")
                     from dataclasses import replace as dataclass_replace
@@ -1228,7 +1266,8 @@ class RoutingBackend(SubagentBackend):
                     mc = spec_obj.model_config if spec_obj is not None else None
                     existing_id = getattr(self, "execution_identity", None)
                     if isinstance(existing_id, ExecutionIdentity):
-                        self.execution_identity = dataclass_replace(existing_id, model=str(session_bundle.get("resolved_model", "") or existing_id.model), provider=str(session_bundle.get("resolved_provider", "") or existing_id.provider), model_family=str(session_bundle.get("resolved_model_family", "") or existing_id.model_family), reasoning_effort=str(session_bundle.get("reasoning_effort", "") or existing_id.reasoning_effort), require_distinct_model_family_from_author=bool(mc.require_distinct_model_family_from_author) if mc else existing_id.require_distinct_model_family_from_author, disallowed_models=(mc.disallowed_models if mc else existing_id.disallowed_models))
+                        preserve_model = post_run_backend_id is not None and post_run_backend_id != pre_run_backend_id and session_bundle.get("resolution_source", session_bundle.get("model_resolution_source")) not in ("preferred", "fallback")
+                        self.execution_identity = dataclass_replace(existing_id, model=existing_id.model if preserve_model else str(session_bundle.get("resolved_model", "") or existing_id.model), provider=str(session_bundle.get("resolved_provider", "") or existing_id.provider), model_family=str(session_bundle.get("resolved_model_family", "") or existing_id.model_family), reasoning_effort=str(session_bundle.get("reasoning_effort", "") or existing_id.reasoning_effort), require_distinct_model_family_from_author=bool(mc.require_distinct_model_family_from_author) if mc else existing_id.require_distinct_model_family_from_author, disallowed_models=(mc.disallowed_models if mc else existing_id.disallowed_models))
                     elif mc and mc.is_configured:
                         self.execution_identity = ExecutionIdentity(agent_name=candidate.name, harness_kind=str(session_bundle.get("harness_family", "") or ""), executable_or_endpoint=candidate.name, model=str(session_bundle.get("resolved_model", "") or ""), provider=str(session_bundle.get("resolved_provider", "") or ""), model_family=str(session_bundle.get("resolved_model_family", "") or ""), reasoning_effort=str(session_bundle.get("reasoning_effort", "") or ""), require_distinct_model_family_from_author=mc.require_distinct_model_family_from_author, disallowed_models=mc.disallowed_models)
                 require_ev = bool(call_kwargs.get("require_skill_evidence", False) or getattr(self, "require_skill_evidence", False) or getattr(candidate.backend, "require_skill_evidence", False))
@@ -1248,6 +1287,7 @@ class RoutingBackend(SubagentBackend):
                     final_status="succeeded",
                     total_duration_ms=(self._clock() - run_start) * 1000.0,
                     **telemetry_extra,
+                    **({"salvage_receipts": list(self.last_salvage_receipts)} if self.last_salvage_receipts else {}),
                 )
                 return result
             except BaseException as exc:
